@@ -72,6 +72,16 @@ in pkgs.buildGoModule {
 
   modRoot = "./backend-go";
 
+  # Runtime dependencies
+  buildInputs = [ pkgs.exiftool ];
+
+  # Make exiftool available at runtime
+  postInstall = ''
+    wrapProgram $out/bin/backend --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.exiftool ]}
+  '';
+
+  nativeBuildInputs = [ pkgs.makeWrapper ];
+
   preBuild = ''
     mkdir -p frontend
     cp -r ${frontend}/build frontend/build
@@ -79,6 +89,12 @@ in pkgs.buildGoModule {
 
   # Build only main.go
   subPackages = [ "." ];
+
+  # Run backend tests with the testbuild tag, which swaps out the //go:embed
+  # directive for an empty stub so tests compile without a pre-built frontend.
+  # Frontend tests are kept disabled (doCheck = false in buildNpmPackage) because
+  # they require a browser/jsdom environment not available in the Nix sandbox.
+  checkFlags = [ "-tags" "testbuild" ];
 
   meta = with pkgs.lib; {
     description = "Web-based photo import and selection tool for Canon cameras";

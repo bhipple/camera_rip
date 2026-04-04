@@ -159,6 +159,33 @@ The project includes a Makefile with convenient commands:
 - **`make frontend`**: Build only the frontend
 - **`make clean`**: Remove all build artifacts
 
+## Testing
+
+### Backend tests
+
+The backend uses a `testbuild` build tag to avoid requiring a pre-built React bundle at test time:
+
+```bash
+cd backend-go && go test -tags testbuild ./...
+```
+
+This runs both unit tests (camera brand detection, filename parsing, raw-file detection) and integration tests (folder import with custom destination, thumbnail caching, photo serving).
+
+### Frontend tests
+
+```bash
+cd frontend && npx react-scripts test --watchAll=false
+```
+
+### All tests (CI equivalent)
+
+```bash
+cd backend-go && gofmt -l .          # Go formatting check
+cd backend-go && go vet ./...         # Go static analysis
+cd backend-go && go test -tags testbuild ./...
+cd frontend && npx react-scripts test --watchAll=false
+```
+
 ## Continuous Integration
 
 The project includes GitHub Actions CI that automatically:

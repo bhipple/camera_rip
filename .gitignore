@@ -1,6 +1,7 @@
 # Frontend build artifacts
 frontend/build/
 backend-go/frontend/
+backend-go/tmp/
 
 # Go binary
 backend-go/camera-rip
@@ -20,3 +21,7 @@ frontend/node_modules/
 
 # OS files
 .DS_Store
+
+# Misc
+.claude
+result

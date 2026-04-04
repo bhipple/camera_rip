@@ -36,6 +36,14 @@ function App() {
     const currentPhotoNameRef = useRef(null);
     const [importPreview, setImportPreview] = useState(null);
     const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+    const [importMode, setImportMode] = useState('camera');
+    const [sourceDirectory, setSourceDirectory] = useState('');
+    const [destinationBase, setDestinationBase] = useState('');
+    const [recursiveScan, setRecursiveScan] = useState(false);
+    const [importRawFiles, setImportRawFiles] = useState(false);
+    const [recentSourcePaths, setRecentSourcePaths] = useState([]);
+    const [recentDestPaths, setRecentDestPaths] = useState([]);
+    const [isFullScreen, setIsFullScreen] = useState(false);
 
     const fetchDirectories = useCallback(() => {
         fetch(`${API_URL}/api/directories`)
@@ -68,24 +76,49 @@ function App() {
 
     useEffect(() => {
         fetchDirectories();
+
+        // Fetch recent paths
+        fetch(`${API_URL}/api/recent-paths?type=source`)
+            .then(res => res.json())
+            .then(data => setRecentSourcePaths(data || []))
+            .catch(err => setRecentSourcePaths([]));
+
+        fetch(`${API_URL}/api/recent-paths?type=destination`)
+            .then(res => res.json())
+            .then(data => setRecentDestPaths(data || []))
+            .catch(err => setRecentDestPaths([]));
     }, [fetchDirectories]);
 
     const fetchImportPreview = useCallback(async () => {
         setIsLoadingPreview(true);
         try {
-            const response = await fetch(`${API_URL}/api/import-preview`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
+            const endpoint = importMode === 'camera' ? '/api/import-preview' : '/api/import-from-folder-preview';
+            const body = importMode === 'camera'
+                ? {
+                    since: sinceDate,
+                    until: untilDate,
+                    skip_duplicates: skipDuplicates,
+                    target_directory: addToCurrentBatch ? currentDirectory : '',
+                    import_videos: importVideos
+                }
+                : {
+                    source_directory: sourceDirectory,
+                    destination_base: destinationBase,
                     since: sinceDate,
                     until: untilDate,
                     skip_duplicates: skipDuplicates,
                     target_directory: addToCurrentBatch ? currentDirectory : '',
                     import_videos: importVideos,
-                    import_raws: importRaws
-                })
+                    import_raw_files: importRawFiles,
+                    recursive: recursiveScan
+                };
+
+            const response = await fetch(`${API_URL}${endpoint}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body)
             });
             const data = await response.json();
             if (response.ok) {
@@ -97,7 +130,7 @@ function App() {
             setImportPreview(null);
         }
         setIsLoadingPreview(false);
-    }, [sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, importRaws]);
+    }, [importMode, sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase, recursiveScan, importRawFiles]);
 
     useEffect(() => {
         fetchImportPreview();
@@ -105,30 +138,49 @@ function App() {
 
     const handleImport = async () => {
         setIsImporting(true);
-        const toastId = toast.loading("Importing from USB...")
+        const toastId = toast.loading(importMode === 'camera' ? "Importing from USB..." : "Importing from folder...");
         try {
-            const response = await fetch(`${API_URL}/api/import`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
+            const endpoint = importMode === 'camera' ? '/api/import' : '/api/import-from-folder';
+            const body = importMode === 'camera'
+                ? {
+                    since: sinceDate,
+                    until: untilDate,
+                    skip_duplicates: skipDuplicates,
+                    target_directory: addToCurrentBatch ? currentDirectory : '',
+                    import_videos: importVideos
+                }
+                : {
+                    source_directory: sourceDirectory,
+                    destination_base: destinationBase,
                     since: sinceDate,
                     until: untilDate,
                     skip_duplicates: skipDuplicates,
                     target_directory: addToCurrentBatch ? currentDirectory : '',
                     import_videos: importVideos,
-                    import_raws: importRaws
-                })
+                    import_raw_files: importRawFiles,
+                    recursive: recursiveScan
+                };
+
+            const response = await fetch(`${API_URL}${endpoint}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body)
             });
-            const data = await response.json();
+            const responseText = await response.text();
+            let data;
+            try {
+                data = JSON.parse(responseText);
+            } catch (e) {
+                data = { error: responseText || 'Unknown server error' };
+            }
             if (response.ok) {
                 toast.update(toastId, { render: data.message, type: "success", isLoading: false, autoClose: 5000 });
                 if (data.new_directory && !addToCurrentBatch) {
                     fetchDirectories();
                     setCurrentDirectory(data.new_directory);
                 } else if (addToCurrentBatch) {
-                    // Refresh the current directory's photos
                     window.location.reload();
                 }
             } else {
@@ -343,6 +395,83 @@ function App() {
         setIsDeletingPhotos(false);
     };
 
+    const handleCopyToClipboard = async (photoName) => {
+        if (!photoName || !currentDirectory) return;
+
+        const toastId = toast.loading("Copying image to clipboard...");
+
+        try {
+            // Check if clipboard API is available
+            if (!navigator.clipboard || !navigator.clipboard.write) {
+                toast.update(toastId, {
+                    render: "Clipboard API not supported in this browser",
+                    type: "error",
+                    isLoading: false,
+                    autoClose: 3000
+                });
+                return;
+            }
+
+            // Fetch the image
+            const imageUrl = `${API_URL}/photos/${encodeURIComponent(photoName)}?dir=${encodeURIComponent(currentDirectory)}`;
+            const response = await fetch(imageUrl);
+
+            if (!response.ok) {
+                throw new Error('Failed to fetch image');
+            }
+
+            const blob = await response.blob();
+
+            // Convert to PNG using canvas (more compatible with clipboard)
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+
+            await new Promise((resolve, reject) => {
+                img.onload = resolve;
+                img.onerror = reject;
+                img.src = URL.createObjectURL(blob);
+            });
+
+            // Create canvas and draw image
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+
+            // Clean up object URL
+            URL.revokeObjectURL(img.src);
+
+            // Convert canvas to PNG blob
+            const pngBlob = await new Promise(resolve => {
+                canvas.toBlob(resolve, 'image/png');
+            });
+
+            // Create a ClipboardItem with the PNG blob
+            const clipboardItem = new ClipboardItem({
+                'image/png': pngBlob
+            });
+
+            // Write to clipboard
+            await navigator.clipboard.write([clipboardItem]);
+
+            toast.update(toastId, {
+                render: `${photoName} copied to clipboard!`,
+                type: "success",
+                isLoading: false,
+                autoClose: 2000
+            });
+        } catch (err) {
+            console.error('Failed to copy image to clipboard:', err);
+            toast.update(toastId, {
+                render: `Failed to copy: ${err.message || 'Unknown error'}`,
+                type: "error",
+                isLoading: false,
+                autoClose: 5000
+            });
+        }
+    };
+
     // Filter photos based on carousel filter mode
     const filteredPhotos = React.useMemo(() => {
         if (carouselFilter === 'selected') {
@@ -419,6 +548,28 @@ function App() {
 
     useEffect(() => {
         const handleKeyDown = (e) => {
+            // Handle full screen toggle (works even with no photos)
+            if (e.key === 'f' || e.key === 'F') {
+                setIsFullScreen(prev => !prev);
+                return;
+            }
+
+            // Handle Escape key (exit full screen or unpin)
+            if (e.key === 'Escape') {
+                if (isFullScreen) {
+                    setIsFullScreen(false);
+                } else {
+                    setPinnedPhoto(null);
+                }
+                return;
+            }
+
+            // In full screen mode, up/down arrows are used for zoom (handled by PhotoViewer)
+            // So we skip them here
+            if (isFullScreen && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+                return;
+            }
+
             if (filteredPhotos.length === 0) return;
             const currentPhotoName = filteredPhotos[currentIndex];
 
@@ -429,28 +580,18 @@ function App() {
             } else if (e.key === 'd') {
                 handleDeletion(currentPhotoName, !deletedPhotos.has(currentPhotoName));
             } else if (e.key === 'h') {
-                if (isFullscreen) return; // Pin-to-compare disabled in fullscreen
+                if (isFullScreen) return; // Pin-to-compare disabled in fullscreen
                 if (pinnedPhoto === currentPhotoName) {
                     setPinnedPhoto(null); // Unpin if it's the same photo
                 } else {
                     setPinnedPhoto(currentPhotoName);
                 }
-            } else if (e.key === 'f') {
-                setIsFullscreen(prev => {
-                    const next = !prev;
-                    if (next) setPinnedPhoto(null);
-                    return next;
-                });
+            } else if ((e.key === 'c' || e.key === 'C') && isFullScreen) {
+                handleCopyToClipboard(currentPhotoName);
             } else if (e.key === 'ArrowRight' || e.key === 'k') {
                 navigate(1);
             } else if (e.key === 'ArrowLeft' || e.key === 'j') {
                 navigate(-1);
-            } else if (e.key === 'Escape') {
-                if (isFullscreen) {
-                    setIsFullscreen(false);
-                } else {
-                    setPinnedPhoto(null);
-                }
             }
         };
 
@@ -458,7 +599,7 @@ function App() {
         return () => {
             window.removeEventListener('keydown', handleKeyDown);
         };
-    }, [currentIndex, filteredPhotos, handleSelection, handleDeletion, navigate, pinnedPhoto, deletedPhotos, isFullscreen]);
+    }, [currentIndex, filteredPhotos, handleSelection, handleDeletion, navigate, pinnedPhoto, deletedPhotos, isFullScreen]);
 
     const currentPhotoName = filteredPhotos.length > 0 && currentIndex < filteredPhotos.length
         ? filteredPhotos[currentIndex]
@@ -548,6 +689,91 @@ function App() {
                             </p>
                         </div>
                     )}
+
+                    {/* Import Mode Toggle */}
+                    <div className="import-mode-toggle">
+                        <label>
+                            <input
+                                type="radio"
+                                name="importMode"
+                                value="camera"
+                                checked={importMode === 'camera'}
+                                onChange={e => setImportMode(e.target.value)}
+                            />
+                            <span>Camera Mode</span>
+                        </label>
+                        <label>
+                            <input
+                                type="radio"
+                                name="importMode"
+                                value="folder"
+                                checked={importMode === 'folder'}
+                                onChange={e => setImportMode(e.target.value)}
+                            />
+                            <span>Folder Mode</span>
+                        </label>
+                    </div>
+
+                    {/* Folder Mode Controls */}
+                    {importMode === 'folder' && (
+                        <div className="folder-import-controls">
+                            <div className="directory-input-group">
+                                <label htmlFor="source-directory">Source:</label>
+                                <input
+                                    type="text"
+                                    id="source-directory"
+                                    list="recent-source-paths"
+                                    value={sourceDirectory}
+                                    onChange={e => setSourceDirectory(e.target.value)}
+                                    placeholder="/path/to/source"
+                                    className="directory-input"
+                                />
+                                <datalist id="recent-source-paths">
+                                    {recentSourcePaths.map((path, idx) => (
+                                        <option key={idx} value={path} />
+                                    ))}
+                                </datalist>
+                            </div>
+                            <div className="directory-input-group">
+                                <label htmlFor="destination-base">Destination:</label>
+                                <input
+                                    type="text"
+                                    id="destination-base"
+                                    list="recent-dest-paths"
+                                    value={destinationBase}
+                                    onChange={e => setDestinationBase(e.target.value)}
+                                    placeholder="~/Pictures/photos (default)"
+                                    className="directory-input"
+                                />
+                                <datalist id="recent-dest-paths">
+                                    {recentDestPaths.map((path, idx) => (
+                                        <option key={idx} value={path} />
+                                    ))}
+                                </datalist>
+                            </div>
+                            <div className="checkbox-container">
+                                <label>
+                                    <input
+                                        type="checkbox"
+                                        checked={recursiveScan}
+                                        onChange={e => setRecursiveScan(e.target.checked)}
+                                    />
+                                    <span>Scan subdirectories</span>
+                                </label>
+                            </div>
+                            <div className="checkbox-container">
+                                <label>
+                                    <input
+                                        type="checkbox"
+                                        checked={importRawFiles}
+                                        onChange={e => setImportRawFiles(e.target.checked)}
+                                    />
+                                    <span>Import raw files (.CR3, .CR2, etc.)</span>
+                                </label>
+                            </div>
+                        </div>
+                    )}
+
                     <button onClick={handleImport} disabled={isImporting} className="import-button">
                         {isImporting ? 'Importing...' : 'Import'}
                     </button>
@@ -622,7 +848,7 @@ function App() {
                         <div className="import-preview loading">
                             <p>Loading preview...</p>
                         </div>
-                    ) : importPreview && importPreview.usb_connected ? (
+                    ) : importPreview && (importMode === 'folder' || importPreview.usb_connected) ? (
                         <div className="import-preview">
                             {importPreview.error ? (
                                 <p className="preview-error">{importPreview.error}</p>
@@ -662,24 +888,24 @@ function App() {
                                             <span className="preview-value">{importPreview.skipped_videos}</span>
                                         </div>
                                     )}
-                                    {importPreview.skipped_raws > 0 && (
+                                    {importPreview.skipped_raw_files > 0 && (
                                         <div className="preview-stat">
-                                            <span className="preview-label">Will skip (RAWs):</span>
-                                            <span className="preview-value">{importPreview.skipped_raws}</span>
+                                            <span className="preview-label">Will skip (raw files):</span>
+                                            <span className="preview-value">{importPreview.skipped_raw_files}</span>
                                         </div>
                                     )}
                                     <div className="preview-stat">
-                                        <span className="preview-label">Total on USB:</span>
+                                        <span className="preview-label">{importMode === 'camera' ? 'Total on USB:' : 'Total in folder:'}</span>
                                         <span className="preview-value">{importPreview.total_files}</span>
                                     </div>
                                 </>
                             )}
                         </div>
-                    ) : (
+                    ) : importMode === 'camera' ? (
                         <div className="import-preview error">
                             <p>USB not detected</p>
                         </div>
-                    )}
+                    ) : null}
                 </div>
 
                 <div className="sidebar-controls">
@@ -902,7 +1128,7 @@ function App() {
                     )}
                 </div>
                 <div className="instructions">
-                    <p>Use 's' to select, 'x' to unselect, 'd' to mark for deletion, 'h' to pin/unpin, and 'f' to toggle fullscreen. Press 'Escape' to exit fullscreen or clear pinned photo.</p>
+                    <p>Use 's' to select, 'x' to unselect, 'd' to mark for deletion, 'h' to pin/unpin, and 'f' for fullscreen. In fullscreen: 'c' to copy to clipboard, double-click or ↑/↓ arrows to zoom. Press 'Escape' to exit.</p>
                     {exportStatus.selected_count > 0 && (
                         <p className="export-status">
                             Export Status: {exportStatus.selected_count} selected JPEGs, {exportStatus.raw_count} raw files exported, {exportStatus.missing_count} missing
@@ -910,6 +1136,27 @@ function App() {
                     )}
                 </div>
             </main>
+
+            {/* Full Screen Mode */}
+            {isFullScreen && currentPhotoName && (
+                <div className="fullscreen-overlay">
+                    <PhotoViewer
+                        photoName={currentPhotoName}
+                        directory={currentDirectory}
+                        isSelected={isSelected}
+                        isSaved={isSaved}
+                        isDeleted={isDeleted}
+                    />
+                    <div className="fullscreen-info">
+                        <div className="fullscreen-filename">{currentPhotoName}</div>
+                        <div className="fullscreen-position">{currentIndex + 1} / {filteredPhotos.length}</div>
+                        <div className={`fullscreen-status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
+                            {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                        </div>
+                        <div className="fullscreen-hint">C to copy • Double-click or ↑/↓ to zoom • F or ESC to exit</div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
@@ -949,7 +1196,7 @@ function Carousel({ photos, currentIndex, setCurrentIndex, currentDirectory, sel
                         onClick={() => setCurrentIndex(photoIndex)}
                     >
                         <img
-                            src={`${API_URL}/thumbnail/${encodeURIComponent(currentDirectory)}/${encodeURIComponent(photoName)}`}
+                            src={`${API_URL}/thumbnail/${encodeURIComponent(photoName)}?dir=${encodeURIComponent(currentDirectory)}`}
                             alt={`thumbnail-${photoName}`}
                         />
                     </div>
@@ -974,7 +1221,7 @@ function ThumbnailGrid({ photos, currentIndex, setCurrentIndex, currentDirectory
                         title={photoName}
                     >
                         <img
-                            src={`${API_URL}/thumbnail/${encodeURIComponent(currentDirectory)}/${encodeURIComponent(photoName)}`}
+                            src={`${API_URL}/thumbnail/${encodeURIComponent(photoName)}?dir=${encodeURIComponent(currentDirectory)}`}
                             alt={photoName}
                             loading="lazy"
                         />

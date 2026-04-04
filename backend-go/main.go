@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"embed"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -15,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -27,13 +27,11 @@ import (
 	"regexp"
 )
 
-//go:embed all:frontend/build
-var frontend embed.FS
-
 var (
-	photoBaseDir      string
-	thumbnailCacheDir string
-	thumbnailSize     = 200
+	photoBaseDir       string
+	thumbnailCacheDir  string
+	rawPreviewCacheDir string
+	thumbnailSize      = 200
 )
 
 type cameraBrand struct {
@@ -210,6 +208,7 @@ func main() {
 	}
 	photoBaseDir = filepath.Join(userHomeDir, "Pictures", "photos")
 	thumbnailCacheDir = filepath.Join(photoBaseDir, ".thumbnails")
+	rawPreviewCacheDir = filepath.Join(photoBaseDir, ".raw_previews")
 
 	if err := os.MkdirAll(photoBaseDir, 0755); err != nil {
 		log.Fatalf("Failed to create photo base directory: %v", err)
@@ -217,12 +216,18 @@ func main() {
 	if err := os.MkdirAll(thumbnailCacheDir, 0755); err != nil {
 		log.Fatalf("Failed to create thumbnail cache directory: %v", err)
 	}
+	if err := os.MkdirAll(rawPreviewCacheDir, 0755); err != nil {
+		log.Fatalf("Failed to create raw preview cache directory: %v", err)
+	}
 
 	http.HandleFunc("/api/directories", corsHandler(listDirectoriesHandler))
 	http.HandleFunc("/api/photos", corsHandler(getPhotosHandler))
 	http.HandleFunc("/api/save", corsHandler(saveSelectedPhotosHandler))
 	http.HandleFunc("/api/import", corsHandler(importFromUSBHandler))
 	http.HandleFunc("/api/import-preview", corsHandler(importPreviewHandler))
+	http.HandleFunc("/api/import-from-folder", corsHandler(importFromFolderHandler))
+	http.HandleFunc("/api/import-from-folder-preview", corsHandler(importFromFolderPreviewHandler))
+	http.HandleFunc("/api/recent-paths", corsHandler(recentPathsHandler))
 	http.HandleFunc("/api/export-raw", corsHandler(exportRawFilesHandler))
 	http.HandleFunc("/api/export-raw-single", corsHandler(exportRawSingleFileHandler))
 	http.HandleFunc("/api/export-status", corsHandler(exportStatusHandler))
@@ -282,6 +287,28 @@ func listDirectoriesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(dirs)
 }
 
+// resolvePhotoDir returns the absolute path for a directory: if already absolute, use as-is;
+// otherwise join with photoBaseDir.
+func resolvePhotoDir(directory string) string {
+	if filepath.IsAbs(directory) {
+		return directory
+	}
+	return filepath.Join(photoBaseDir, directory)
+}
+
+// directoryCacheKey returns a safe relative path to use under cache directories.
+// Paths already under photoBaseDir become relative; other absolute paths strip the leading slash.
+func directoryCacheKey(directory string) string {
+	if filepath.IsAbs(directory) {
+		rel, err := filepath.Rel(photoBaseDir, directory)
+		if err == nil && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+		return strings.TrimPrefix(directory, "/")
+	}
+	return directory
+}
+
 func getPhotosHandler(w http.ResponseWriter, r *http.Request) {
 	directory := r.URL.Query().Get("directory")
 	if directory == "" {
@@ -289,7 +316,7 @@ func getPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetDir := filepath.Join(photoBaseDir, directory)
+	targetDir := resolvePhotoDir(directory)
 	files, err := ioutil.ReadDir(targetDir)
 	if err != nil {
 		http.Error(w, "Failed to read photo directory", http.StatusInternalServerError)
@@ -335,7 +362,7 @@ func getSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	selectedDir := filepath.Join(photoBaseDir, directory, "selected")
+	selectedDir := filepath.Join(resolvePhotoDir(directory), "selected")
 	files, err := ioutil.ReadDir(selectedDir)
 	if err != nil {
 		// If the directory doesn't exist, it just means no photos have been selected yet.
@@ -388,7 +415,7 @@ func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sourceDir := filepath.Join(photoBaseDir, data.Directory)
+	sourceDir := resolvePhotoDir(data.Directory)
 	destinationDir := filepath.Join(sourceDir, "selected")
 
 	if err := os.MkdirAll(destinationDir, 0755); err != nil {
@@ -1090,7 +1117,7 @@ func exportStatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sourceDir := filepath.Join(photoBaseDir, directory)
+	sourceDir := resolvePhotoDir(directory)
 	selectedDir := filepath.Join(sourceDir, "selected")
 	rawDir := filepath.Join(selectedDir, "raw")
 
@@ -1260,7 +1287,7 @@ func deletePhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetDir := filepath.Join(photoBaseDir, data.Directory)
+	targetDir := resolvePhotoDir(data.Directory)
 	deletedCount := 0
 	notFoundCount := 0
 	errorCount := 0
@@ -1308,7 +1335,7 @@ func deletePhotosHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Deleted file: %s", filename)
 
 			// Also try to delete thumbnail if it exists
-			thumbnailPath := filepath.Join(thumbnailCacheDir, data.Directory, filename)
+			thumbnailPath := filepath.Join(thumbnailCacheDir, directoryCacheKey(data.Directory), filename)
 			if err := os.Remove(thumbnailPath); err != nil && !os.IsNotExist(err) {
 				log.Printf("Failed to delete thumbnail %s: %v", thumbnailPath, err)
 			}
@@ -1322,6 +1349,625 @@ func deletePhotosHandler(w http.ResponseWriter, r *http.Request) {
 		"not_found": notFoundCount,
 		"errors":    errorCount,
 	})
+}
+
+type recentPathsData struct {
+	Source      []string `json:"source"`
+	Destination []string `json:"destination"`
+}
+
+func getRecentPathsFilePath() string {
+	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Failed to get user home directory: %v", err)
+		return ""
+	}
+	cacheDir := filepath.Join(userHomeDir, ".cache", "camera_rip")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		log.Printf("Failed to create cache directory: %v", err)
+		return ""
+	}
+	return filepath.Join(cacheDir, "recent_paths.json")
+}
+
+func loadRecentPaths() recentPathsData {
+	var paths recentPathsData
+	filePath := getRecentPathsFilePath()
+	if filePath == "" {
+		return paths
+	}
+
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Failed to read recent paths file: %v", err)
+		}
+		return paths
+	}
+
+	if err := json.Unmarshal(data, &paths); err != nil {
+		log.Printf("Failed to parse recent paths file: %v", err)
+		return recentPathsData{}
+	}
+
+	return paths
+}
+
+func saveRecentPath(path, pathType string) error {
+	filePath := getRecentPathsFilePath()
+	if filePath == "" {
+		return nil
+	}
+
+	paths := loadRecentPaths()
+
+	var targetList *[]string
+	if pathType == "source" {
+		targetList = &paths.Source
+	} else if pathType == "destination" {
+		targetList = &paths.Destination
+	} else {
+		return nil
+	}
+
+	// Remove if already exists
+	for i, p := range *targetList {
+		if p == path {
+			*targetList = append((*targetList)[:i], (*targetList)[i+1:]...)
+			break
+		}
+	}
+
+	// Add to front
+	*targetList = append([]string{path}, *targetList...)
+
+	// Keep only last 10
+	if len(*targetList) > 10 {
+		*targetList = (*targetList)[:10]
+	}
+
+	data, err := json.MarshalIndent(paths, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(filePath, data, 0644)
+}
+
+func recentPathsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		pathType := r.URL.Query().Get("type")
+		if pathType != "source" && pathType != "destination" {
+			http.Error(w, "Invalid 'type' parameter. Must be 'source' or 'destination'", http.StatusBadRequest)
+			return
+		}
+
+		paths := loadRecentPaths()
+		var result []string
+		if pathType == "source" {
+			result = paths.Source
+		} else {
+			result = paths.Destination
+		}
+
+		if result == nil {
+			result = []string{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	} else if r.Method == "POST" {
+		var data struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if data.Path == "" || data.Type == "" {
+			http.Error(w, "Missing 'path' or 'type' in request", http.StatusBadRequest)
+			return
+		}
+
+		if data.Type != "source" && data.Type != "destination" {
+			http.Error(w, "Invalid 'type'. Must be 'source' or 'destination'", http.StatusBadRequest)
+			return
+		}
+
+		if err := saveRecentPath(data.Path, data.Type); err != nil {
+			http.Error(w, "Failed to save recent path", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": "Recent path saved",
+		})
+	} else {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		SourceDirectory string `json:"source_directory"`
+		DestinationBase string `json:"destination_base"`
+		Since           string `json:"since"`
+		Until           string `json:"until"`
+		SkipDuplicates  bool   `json:"skip_duplicates"`
+		TargetDirectory string `json:"target_directory"`
+		ImportVideos    bool   `json:"import_videos"`
+		ImportRawFiles  bool   `json:"import_raw_files"`
+		Recursive       bool   `json:"recursive"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if data.SourceDirectory == "" {
+		http.Error(w, "Missing 'source_directory'", http.StatusBadRequest)
+		return
+	}
+
+	// Validate source directory exists
+	if _, err := os.Stat(data.SourceDirectory); os.IsNotExist(err) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"total_files":     0,
+			"files_to_import": 0,
+			"files_to_skip":   0,
+			"error":           "Source directory does not exist",
+		})
+		return
+	}
+
+	// Parse dates
+	var sinceDate time.Time
+	var untilDate time.Time
+	var err error
+	if data.Since != "" {
+		sinceDate, err = time.Parse("2006-01-02", data.Since)
+		if err != nil {
+			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
+			return
+		}
+	}
+	if data.Until != "" {
+		untilDate, err = time.Parse("2006-01-02", data.Until)
+		if err != nil {
+			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
+			return
+		}
+		untilDate = untilDate.AddDate(0, 0, 1)
+	}
+
+	// Scan directory for files
+	var allFiles []os.FileInfo
+	if data.Recursive {
+		filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
+				allFiles = append(allFiles, info)
+			}
+			return nil
+		})
+	} else {
+		files, err := ioutil.ReadDir(data.SourceDirectory)
+		if err != nil {
+			http.Error(w, "Failed to read source directory", http.StatusInternalServerError)
+			return
+		}
+		for _, file := range files {
+			if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
+				allFiles = append(allFiles, file)
+			}
+		}
+	}
+
+	// Build imported files set if skip duplicates enabled
+	var importedFiles map[string]bool
+	if data.SkipDuplicates {
+		importedFiles = buildImportedFilesSet()
+	}
+
+	// Determine destination directory for duplicate checking
+	var destinationDir string
+	if data.TargetDirectory != "" {
+		destinationDir = filepath.Join(photoBaseDir, data.TargetDirectory)
+		if _, err := os.Stat(destinationDir); os.IsNotExist(err) {
+			http.Error(w, "Target directory does not exist", http.StatusBadRequest)
+			return
+		}
+	}
+
+	totalFiles := 0
+	filesToImport := 0
+	skippedDuplicates := 0
+	skippedByDate := 0
+	skippedVideos := 0
+	skippedRawFiles := 0
+	dailyBreakdown := make(map[string]int)
+
+	for _, file := range allFiles {
+		lowerName := strings.ToLower(file.Name())
+		isImage := strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") ||
+			strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".gif")
+		isMp4 := strings.HasSuffix(lowerName, ".mp4")
+		isRaw := strings.HasSuffix(lowerName, ".cr3") || strings.HasSuffix(lowerName, ".cr2") ||
+			strings.HasSuffix(lowerName, ".arw") || strings.HasSuffix(lowerName, ".nef") ||
+			strings.HasSuffix(lowerName, ".raf") || strings.HasSuffix(lowerName, ".dng")
+
+		if isImage || isMp4 || isRaw {
+			totalFiles++
+		}
+
+		if !isImage && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRawFiles) {
+			if isMp4 {
+				skippedVideos++
+			}
+			if isRaw {
+				skippedRawFiles++
+			}
+			continue
+		}
+
+		// Check date filter
+		modTime := file.ModTime()
+		if !sinceDate.IsZero() && modTime.Before(sinceDate) {
+			skippedByDate++
+			continue
+		}
+		if !untilDate.IsZero() && !modTime.Before(untilDate) {
+			skippedByDate++
+			continue
+		}
+
+		// Check duplicates
+		if data.SkipDuplicates && importedFiles[file.Name()] {
+			skippedDuplicates++
+			continue
+		}
+
+		// Check if exists in target destination
+		if destinationDir != "" {
+			destinationFile := filepath.Join(destinationDir, file.Name())
+			if _, err := os.Stat(destinationFile); err == nil {
+				skippedDuplicates++
+				continue
+			}
+		}
+
+		filesToImport++
+		dateKey := modTime.Format("2006-01-02")
+		dailyBreakdown[dateKey]++
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total_files":        totalFiles,
+		"files_to_import":    filesToImport,
+		"skipped_duplicates": skippedDuplicates,
+		"skipped_by_date":    skippedByDate,
+		"skipped_videos":     skippedVideos,
+		"skipped_raw_files":  skippedRawFiles,
+		"daily_breakdown":    dailyBreakdown,
+	})
+}
+
+func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		SourceDirectory string `json:"source_directory"`
+		DestinationBase string `json:"destination_base"`
+		Since           string `json:"since"`
+		Until           string `json:"until"`
+		SkipDuplicates  bool   `json:"skip_duplicates"`
+		TargetDirectory string `json:"target_directory"`
+		ImportVideos    bool   `json:"import_videos"`
+		ImportRawFiles  bool   `json:"import_raw_files"`
+		Recursive       bool   `json:"recursive"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if data.SourceDirectory == "" {
+		http.Error(w, "Missing 'source_directory'", http.StatusBadRequest)
+		return
+	}
+
+	// Validate source directory exists
+	if _, err := os.Stat(data.SourceDirectory); os.IsNotExist(err) {
+		http.Error(w, "Source directory does not exist", http.StatusNotFound)
+		return
+	}
+
+	// Determine destination directory
+	var destinationDir string
+	var isNewBatch bool
+	var destBase string
+
+	if data.DestinationBase != "" {
+		destBase = data.DestinationBase
+	} else {
+		destBase = photoBaseDir
+	}
+
+	// Expand tilde in destination base
+	if strings.HasPrefix(destBase, "~/") {
+		userHomeDir, err := os.UserHomeDir()
+		if err != nil {
+			http.Error(w, "Failed to get user home directory", http.StatusInternalServerError)
+			return
+		}
+		destBase = filepath.Join(userHomeDir, destBase[2:])
+	}
+
+	if data.TargetDirectory != "" {
+		destinationDir = filepath.Join(destBase, data.TargetDirectory)
+		isNewBatch = false
+		if _, err := os.Stat(destinationDir); os.IsNotExist(err) {
+			http.Error(w, "Target directory does not exist", http.StatusBadRequest)
+			return
+		}
+	} else {
+		destinationDir = filepath.Join(destBase, time.Now().Format("2006-01-02_15-04-05"))
+		isNewBatch = true
+	}
+
+	// Parse dates
+	var sinceDate time.Time
+	var untilDate time.Time
+	var err error
+	if data.Since != "" {
+		sinceDate, err = time.Parse("2006-01-02", data.Since)
+		if err != nil {
+			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
+			return
+		}
+	}
+	if data.Until != "" {
+		untilDate, err = time.Parse("2006-01-02", data.Until)
+		if err != nil {
+			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
+			return
+		}
+		untilDate = untilDate.AddDate(0, 0, 1)
+	}
+
+	// Scan directory for files
+	type fileWithPath struct {
+		info os.FileInfo
+		path string
+	}
+	var allFiles []fileWithPath
+	if data.Recursive {
+		filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
+				allFiles = append(allFiles, fileWithPath{info: info, path: path})
+			}
+			return nil
+		})
+	} else {
+		files, err := ioutil.ReadDir(data.SourceDirectory)
+		if err != nil {
+			http.Error(w, "Failed to read source directory", http.StatusInternalServerError)
+			return
+		}
+		for _, file := range files {
+			if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
+				allFiles = append(allFiles, fileWithPath{
+					info: file,
+					path: filepath.Join(data.SourceDirectory, file.Name()),
+				})
+			}
+		}
+	}
+
+	// Build imported files set if skip duplicates enabled
+	var importedFiles map[string]bool
+	if data.SkipDuplicates {
+		importedFiles = buildImportedFilesSet()
+	}
+
+	destinationDirCreated := !isNewBatch
+	copiedCount := 0
+	skippedDuplicates := 0
+	var copiedFiles []string
+
+	for _, fileEntry := range allFiles {
+		file := fileEntry.info
+		lowerName := strings.ToLower(file.Name())
+		isImage := strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") ||
+			strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".gif")
+		isMp4 := strings.HasSuffix(lowerName, ".mp4")
+		isRaw := strings.HasSuffix(lowerName, ".cr3") || strings.HasSuffix(lowerName, ".cr2") ||
+			strings.HasSuffix(lowerName, ".arw") || strings.HasSuffix(lowerName, ".nef") ||
+			strings.HasSuffix(lowerName, ".raf") || strings.HasSuffix(lowerName, ".dng")
+
+		if !isImage && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRawFiles) {
+			continue
+		}
+
+		// Check date filter
+		modTime := file.ModTime()
+		if !sinceDate.IsZero() && modTime.Before(sinceDate) {
+			continue
+		}
+		if !untilDate.IsZero() && !modTime.Before(untilDate) {
+			continue
+		}
+
+		// Check duplicates
+		if data.SkipDuplicates && importedFiles[file.Name()] {
+			skippedDuplicates++
+			continue
+		}
+
+		destinationFile := filepath.Join(destinationDir, file.Name())
+		if _, err := os.Stat(destinationFile); err == nil {
+			continue
+		}
+
+		// Create destination directory on first file
+		if !destinationDirCreated {
+			if err := os.MkdirAll(destinationDir, 0755); err != nil {
+				http.Error(w, "Could not create destination directory", http.StatusInternalServerError)
+				return
+			}
+			destinationDirCreated = true
+		}
+
+		// Copy file
+		source, err := os.Open(fileEntry.path)
+		if err != nil {
+			log.Printf("Failed to open source file: %v", err)
+			continue
+		}
+		defer source.Close()
+
+		destination, err := os.Create(destinationFile)
+		if err != nil {
+			log.Printf("Failed to create destination file: %v", err)
+			continue
+		}
+		defer destination.Close()
+
+		if _, err := io.Copy(destination, source); err != nil {
+			log.Printf("Failed to copy file: %v", err)
+			continue
+		}
+
+		copiedCount++
+		// Add both images and raw files for thumbnail generation
+		if isImage || isRaw {
+			copiedFiles = append(copiedFiles, file.Name())
+		}
+	}
+
+	// Handle case where no files were copied
+	if copiedCount == 0 {
+		var message string
+		if !sinceDate.IsZero() || !untilDate.IsZero() {
+			message = "No new files found in the selected date range"
+		} else if skippedDuplicates > 0 {
+			message = "All " + strconv.Itoa(skippedDuplicates) + " files have already been imported."
+		} else {
+			message = "No files found to import."
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message":       message,
+			"new_directory": nil,
+		})
+		return
+	}
+
+	// Save recent paths
+	saveRecentPath(data.SourceDirectory, "source")
+	if data.DestinationBase != "" {
+		saveRecentPath(data.DestinationBase, "destination")
+	}
+
+	// Start async thumbnail generation; use full destinationDir so resolvePhotoDir works correctly
+	dirName := filepath.Base(destinationDir)
+	go func() {
+		log.Printf("Starting background thumbnail generation for imported directory: %s (%d photos)", destinationDir, len(copiedFiles))
+		preGenerateThumbnails(destinationDir, copiedFiles)
+	}()
+
+	message := "Successfully copied " + strconv.Itoa(copiedCount) + " new files"
+	if !isNewBatch {
+		message += " to " + dirName
+	}
+	message += "."
+	if skippedDuplicates > 0 {
+		message += " Skipped " + strconv.Itoa(skippedDuplicates) + " already imported."
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	var newDirectory interface{}
+	if isNewBatch {
+		// Return full path so frontend can resolve photos from the correct location
+		newDirectory = destinationDir
+	} else {
+		newDirectory = nil
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":       message,
+		"new_directory": newDirectory,
+	})
+}
+
+func extractRawPreview(directory, filename string) (string, error) {
+	// Check cache first
+	previewDir := filepath.Join(rawPreviewCacheDir, directoryCacheKey(directory))
+	previewPath := filepath.Join(previewDir, filename+".jpg")
+
+	// Return cached preview if it exists
+	if _, err := os.Stat(previewPath); err == nil {
+		return previewPath, nil
+	}
+
+	// Create preview cache directory
+	if err := os.MkdirAll(previewDir, 0755); err != nil {
+		return "", err
+	}
+
+	rawFilePath := filepath.Join(resolvePhotoDir(directory), filename)
+
+	// Try multiple extraction methods in order of preference
+	extractionMethods := [][]string{
+		{"-b", "-PreviewImage", rawFilePath},
+		{"-b", "-JpgFromRaw", rawFilePath},
+		{"-b", "-OtherImage", rawFilePath},
+		{"-b", "-ThumbnailImage", rawFilePath},
+	}
+
+	var output []byte
+	var err error
+	var lastError error
+
+	for _, args := range extractionMethods {
+		cmd := exec.Command("exiftool", args...)
+		output, err = cmd.CombinedOutput()
+		if err == nil && len(output) > 0 {
+			// Check if output looks like JPEG (starts with FFD8)
+			if len(output) > 2 && output[0] == 0xFF && output[1] == 0xD8 {
+				break
+			}
+		}
+		lastError = err
+	}
+
+	if err != nil || len(output) == 0 {
+		if lastError != nil {
+			log.Printf("Failed to extract preview from %s: %v (output: %s)", filename, lastError, string(output))
+		} else {
+			log.Printf("Failed to extract preview from %s: no valid JPEG data found", filename)
+		}
+		return "", lastError
+	}
+
+	// Write preview to cache
+	if err := ioutil.WriteFile(previewPath, output, 0644); err != nil {
+		return "", err
+	}
+
+	log.Printf("Extracted preview for raw file: %s (%d bytes)", filename, len(output))
+	return previewPath, nil
 }
 
 // findCameraDirectories returns DCIM subdirectories whose suffix matches a supported brand
@@ -1424,7 +2070,7 @@ func findUSBMountPoint() string {
 }
 
 func generateThumbnail(directory, filename string) error {
-	thumbnailDir := filepath.Join(thumbnailCacheDir, directory)
+	thumbnailDir := filepath.Join(thumbnailCacheDir, directoryCacheKey(directory))
 	thumbnailPath := filepath.Join(thumbnailDir, filename)
 
 	// Check if thumbnail already exists
@@ -1432,7 +2078,7 @@ func generateThumbnail(directory, filename string) error {
 		return nil // Already exists
 	}
 
-	originalPhotoPath := filepath.Join(photoBaseDir, directory, filename)
+	originalPhotoPath := filepath.Join(resolvePhotoDir(directory), filename)
 
 	var img image.Image
 	if isRawFile(filename) {
@@ -1501,40 +2147,42 @@ func preGenerateThumbnails(directory string, photos []string) {
 }
 
 func servePhotoHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/photos/"), "/")
-	if len(parts) < 2 {
+	directory := r.URL.Query().Get("dir")
+	filename := strings.TrimPrefix(r.URL.Path, "/photos/")
+
+	if directory == "" || filename == "" {
 		http.Error(w, "Invalid photo path", http.StatusBadRequest)
 		return
 	}
-	directory := parts[0]
-	filename := parts[1]
-	photoPath := filepath.Join(photoBaseDir, directory, filename)
 
+	// Check if it's a raw file
 	if isRawFile(filename) {
-		jpegData, err := extractEmbeddedJPEG(photoPath)
+		// Extract and serve the preview
+		previewPath, err := extractRawPreview(directory, filename)
 		if err != nil {
-			http.Error(w, "Failed to extract preview from RAW file", http.StatusInternalServerError)
-			log.Printf("Error extracting JPEG from RAW %s: %v", photoPath, err)
+			http.Error(w, "Failed to extract raw preview", http.StatusInternalServerError)
+			log.Printf("Error extracting raw preview for %s: %v", filename, err)
 			return
 		}
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(jpegData)
+		http.ServeFile(w, r, previewPath)
 		return
 	}
 
+	// Serve regular image file
+	photoPath := filepath.Join(resolvePhotoDir(directory), filename)
 	http.ServeFile(w, r, photoPath)
 }
 
 func serveThumbnailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/thumbnail/"), "/")
-	if len(parts) < 2 {
+	directory := r.URL.Query().Get("dir")
+	filename := strings.TrimPrefix(r.URL.Path, "/thumbnail/")
+
+	if directory == "" || filename == "" {
 		http.Error(w, "Invalid thumbnail path", http.StatusBadRequest)
 		return
 	}
-	directory := parts[0]
-	filename := parts[1]
 
-	thumbnailDir := filepath.Join(thumbnailCacheDir, directory)
+	thumbnailDir := filepath.Join(thumbnailCacheDir, directoryCacheKey(directory))
 	thumbnailPath := filepath.Join(thumbnailDir, filename)
 
 	// Generate thumbnail on-demand if it doesn't exist

@@ -105,12 +105,41 @@ function PhotoViewer({ photoName, directory, isSelected, isSaved, isDeleted, chi
     const handleMouseUpOrLeave = () => {
         setIsPanning(false);
     };
+
+    const handleDoubleClick = (e) => {
+        e.preventDefault();
+        if (zoom === 1) {
+            // Zoom in to 2x on double click
+            setZoom(2);
+        } else {
+            // Reset zoom on double click when already zoomed
+            resetZoomAndPan();
+        }
+    };
     // --- End of Zoom and Pan Handlers ---
 
     // Reset zoom when the photo changes
     React.useEffect(() => {
         resetZoomAndPan();
     }, [photoName, resetZoomAndPan]);
+
+    // Handle keyboard zoom controls (up/down arrows)
+    React.useEffect(() => {
+        const handleKeyDown = (e) => {
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setZoom(prev => Math.min(prev + 0.5, 5));
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setZoom(prev => Math.max(prev - 0.5, 0.5));
+            }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown);
+        };
+    }, []);
 
     if (!photoName || !directory) {
         return null;
@@ -121,7 +150,7 @@ function PhotoViewer({ photoName, directory, isSelected, isSaved, isDeleted, chi
             <div className="photo-wrapper">
                 <img
                     ref={imageRef}
-                    src={`${API_URL}/photos/${encodeURIComponent(directory)}/${encodeURIComponent(photoName)}`}
+                    src={`${API_URL}/photos/${encodeURIComponent(photoName)}?dir=${encodeURIComponent(directory)}`}
                     alt={photoName}
                     className={`photo-display ${isSaved ? 'saved' : (isDeleted ? 'deleted' : (isSelected ? 'selected' : ''))}`}
                     style={{
@@ -134,6 +163,7 @@ function PhotoViewer({ photoName, directory, isSelected, isSaved, isDeleted, chi
                     onMouseMove={handleMouseMove}
                     onMouseUp={handleMouseUpOrLeave}
                     onMouseLeave={handleMouseUpOrLeave}
+                    onDoubleClick={handleDoubleClick}
                 />
             </div>
             <div className="photo-info">
