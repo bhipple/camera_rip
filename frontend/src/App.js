@@ -31,6 +31,7 @@ function App() {
     const [carouselFilter, setCarouselFilter] = useState('all');
     const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
     const [showThumbnailView, setShowThumbnailView] = useState(false);
+    const [isFullscreen, setIsFullscreen] = useState(false);
     const currentPhotoNameRef = useRef(null);
     const [importPreview, setImportPreview] = useState(null);
     const [isLoadingPreview, setIsLoadingPreview] = useState(false);
@@ -425,17 +426,28 @@ function App() {
             } else if (e.key === 'd') {
                 handleDeletion(currentPhotoName, !deletedPhotos.has(currentPhotoName));
             } else if (e.key === 'h') {
+                if (isFullscreen) return; // Pin-to-compare disabled in fullscreen
                 if (pinnedPhoto === currentPhotoName) {
                     setPinnedPhoto(null); // Unpin if it's the same photo
                 } else {
                     setPinnedPhoto(currentPhotoName);
                 }
+            } else if (e.key === 'f') {
+                setIsFullscreen(prev => {
+                    const next = !prev;
+                    if (next) setPinnedPhoto(null);
+                    return next;
+                });
             } else if (e.key === 'ArrowRight' || e.key === 'k') {
                 navigate(1);
             } else if (e.key === 'ArrowLeft' || e.key === 'j') {
                 navigate(-1);
             } else if (e.key === 'Escape') {
-                setPinnedPhoto(null);
+                if (isFullscreen) {
+                    setIsFullscreen(false);
+                } else {
+                    setPinnedPhoto(null);
+                }
             }
         };
 
@@ -443,7 +455,7 @@ function App() {
         return () => {
             window.removeEventListener('keydown', handleKeyDown);
         };
-    }, [currentIndex, filteredPhotos, handleSelection, handleDeletion, navigate, pinnedPhoto, deletedPhotos]);
+    }, [currentIndex, filteredPhotos, handleSelection, handleDeletion, navigate, pinnedPhoto, deletedPhotos, isFullscreen]);
 
     const currentPhotoName = filteredPhotos.length > 0 && currentIndex < filteredPhotos.length
         ? filteredPhotos[currentIndex]
@@ -456,8 +468,45 @@ function App() {
     const isPinnedDeleted = pinnedPhoto ? deletedPhotos.has(pinnedPhoto) : false;
 
     return (
-        <div className="App">
+        <div className={`App ${isFullscreen ? 'fullscreen-mode' : ''}`}>
             <ToastContainer position="bottom-center" autoClose={5000} hideProgressBar={false} newestOnTop={false} closeOnClick rtl={false} pauseOnFocusLoss draggable pauseOnHover theme="dark" />
+            {isFullscreen && currentPhotoName && (
+                <div className="fullscreen-overlay">
+                    <div className="fullscreen-photo">
+                        <PhotoViewer
+                            photoName={currentPhotoName}
+                            directory={currentDirectory}
+                            isSelected={isSelected}
+                            isSaved={isSaved}
+                            isDeleted={isDeleted}
+                        />
+                    </div>
+                    <div className="fullscreen-info">
+                        <div className="fullscreen-filename">{currentPhotoName}</div>
+                        <div className="fullscreen-position">{currentIndex + 1} / {filteredPhotos.length}</div>
+                        <div className={`status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
+                            {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                        </div>
+                    </div>
+                    <div className="fullscreen-controls">
+                        <button onClick={() => navigate(-1)}>← (j)</button>
+                        <button
+                            onClick={() => handleSelection(currentPhotoName, !isSelected)}
+                            disabled={isSaved || isDeleted}
+                            className={`select-toggle-button ${isSaved ? 'saved' : (isSelected ? 'selected' : '')}`}>
+                            {isSaved ? 'SAVED' : (isSelected ? 'Unselect (x)' : 'Select (s)')}
+                        </button>
+                        <button
+                            onClick={() => handleDeletion(currentPhotoName, !isDeleted)}
+                            disabled={isSaved}
+                            className={`delete-toggle-button ${isDeleted ? 'deleted' : ''}`}>
+                            {isDeleted ? 'Unmark Delete (d)' : 'Mark Delete (d)'}
+                        </button>
+                        <button onClick={() => navigate(1)}>→ (k)</button>
+                        <button onClick={() => setIsFullscreen(false)} className="fullscreen-exit">Exit Fullscreen (f / Esc)</button>
+                    </div>
+                </div>
+            )}
             <ConfirmModal
                 isOpen={showDeleteModal}
                 onClose={() => setShowDeleteModal(false)}
@@ -808,6 +857,13 @@ function App() {
                     >
                         {showThumbnailView ? 'Carousel View' : 'Thumbnail View'}
                     </button>
+                    <button
+                        onClick={() => { setPinnedPhoto(null); setIsFullscreen(true); }}
+                        disabled={!currentPhotoName || showThumbnailView}
+                        className="fullscreen-button"
+                    >
+                        Fullscreen (f)
+                    </button>
                     <button onClick={handleSave} disabled={selectedPhotos.size === 0} className="save-button">
                         Save {selectedPhotos.size} new selections
                     </button>
@@ -827,7 +883,7 @@ function App() {
                     )}
                 </div>
                 <div className="instructions">
-                    <p>Use 's' to select, 'x' to unselect, 'd' to mark for deletion, and 'h' to pin/unpin. Press 'Escape' to clear pinned photo.</p>
+                    <p>Use 's' to select, 'x' to unselect, 'd' to mark for deletion, 'h' to pin/unpin, and 'f' to toggle fullscreen. Press 'Escape' to exit fullscreen or clear pinned photo.</p>
                     {exportStatus.selected_count > 0 && (
                         <p className="export-status">
                             Export Status: {exportStatus.selected_count} selected JPEGs, {exportStatus.raw_count} raw files exported, {exportStatus.missing_count} missing
