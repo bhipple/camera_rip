@@ -238,7 +238,7 @@ func listDirectoriesHandler(w http.ResponseWriter, r *http.Request) {
 
 	var dirs []string
 	for _, file := range files {
-		if file.IsDir() && file.Name() != ".thumbnails" {
+		if file.IsDir() && file.Name() != ".thumbnails" && file.Name() != ".raw_previews" {
 			dirs = append(dirs, file.Name())
 		}
 	}
