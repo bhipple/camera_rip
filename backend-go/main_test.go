@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -12,57 +13,6 @@ import (
 	"strings"
 	"testing"
 )
-
-func TestDetectCameraBrand(t *testing.T) {
-	tests := []struct {
-		folderName string
-		wantSuffix string
-	}{
-		{"100CANON", "CANON"},
-		{"101CANON", "CANON"},
-		{"100OLYMP", "OLYMP"},
-		{"100OMSYS", "OMSYS"},
-		{"999OMSYS", "OMSYS"},
-		{"100NIKON", ""}, // Not supported yet
-		{"DCIM", ""},
-	}
-
-	for _, tt := range tests {
-		got := detectCameraBrand(tt.folderName)
-		if tt.wantSuffix == "" {
-			if got != nil {
-				t.Errorf("detectCameraBrand(%q) = %v, want nil", tt.folderName, got.suffix)
-			}
-		} else {
-			if got == nil {
-				t.Errorf("detectCameraBrand(%q) = nil, want %q", tt.folderName, tt.wantSuffix)
-			} else if got.suffix != tt.wantSuffix {
-				t.Errorf("detectCameraBrand(%q) = %q, want %q", tt.folderName, got.suffix, tt.wantSuffix)
-			}
-		}
-	}
-}
-
-func TestGetDCIMPrefix(t *testing.T) {
-	tests := []struct {
-		dir  string
-		want string
-	}{
-		{"100CANON", "100"},
-		{"101OLYMP", "101"},
-		{"102OMSYS", "102"},
-		{"ABC", ""},
-		{"12", ""},
-		{"123", "123"},
-	}
-
-	for _, tt := range tests {
-		got := getDCIMPrefix(tt.dir)
-		if got != tt.want {
-			t.Errorf("getDCIMPrefix(%q) = %q, want %q", tt.dir, got, tt.want)
-		}
-	}
-}
 
 func TestIsRawFile(t *testing.T) {
 	tests := []struct {
@@ -81,6 +31,89 @@ func TestIsRawFile(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("isRawFile(%q) = %v, want %v", tt.filename, got, tt.want)
 		}
+	}
+}
+
+// encodeTestJPEG returns a valid JPEG of the given dimensions.
+func encodeTestJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{R: 200, G: 100, B: 50, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestScanExtractJPEGIgnoresTrailingSensorGarbage is the regression test for the
+// CR3 thumbnail breakage: raw sensor data after the embedded JPEG contains
+// random FF D9 byte pairs, and an EOI-finding strategy based on bytes.LastIndex
+// would extend the "JPEG" into that garbage, producing a blob that jpeg.Decode
+// rejects with "unknown marker" errors.
+func TestScanExtractJPEGIgnoresTrailingSensorGarbage(t *testing.T) {
+	embedded := encodeTestJPEG(t, 32, 32)
+
+	var blob bytes.Buffer
+	blob.WriteString("ftypcrx ") // pretend ISOBMFF header
+	blob.Write(make([]byte, 64)) // non-JPEG container bytes
+	blob.Write(embedded)         // the real embedded JPEG
+	sensor := make([]byte, 8192) // simulated raw sensor data ...
+	for i := 0; i+1 < len(sensor); i += 7 {
+		sensor[i] = 0xFF
+		sensor[i+1] = 0xD9 // ... with scattered FF D9 patterns
+	}
+	blob.Write(sensor)
+
+	got, err := scanExtractJPEG(blob.Bytes(), "fake.cr3")
+	if err != nil {
+		t.Fatalf("scanExtractJPEG returned error: %v", err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("returned bytes did not decode as JPEG: %v", err)
+	}
+	if b := decoded.Bounds(); b.Dx() != 32 || b.Dy() != 32 {
+		t.Errorf("decoded image bounds = %v, want 32x32", b)
+	}
+}
+
+// TestScanExtractJPEGPicksLargest verifies that when multiple JPEGs are
+// embedded (e.g., a small thumbnail and a larger preview), the largest is
+// chosen.
+func TestScanExtractJPEGPicksLargest(t *testing.T) {
+	small := encodeTestJPEG(t, 16, 16)
+	large := encodeTestJPEG(t, 64, 64)
+
+	var blob bytes.Buffer
+	blob.WriteString("ftypcrx ")
+	blob.Write(small)
+	blob.Write(make([]byte, 32))
+	blob.Write(large)
+	blob.Write(make([]byte, 1024))
+
+	got, err := scanExtractJPEG(blob.Bytes(), "fake.cr3")
+	if err != nil {
+		t.Fatalf("scanExtractJPEG returned error: %v", err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("returned bytes did not decode as JPEG: %v", err)
+	}
+	if b := decoded.Bounds(); b.Dx() != 64 || b.Dy() != 64 {
+		t.Errorf("expected largest (64x64), got %v", b)
+	}
+}
+
+// TestScanExtractJPEGNoJPEG verifies the error path when no JPEG is present.
+func TestScanExtractJPEGNoJPEG(t *testing.T) {
+	blob := []byte("plain binary data with no SOI markers anywhere in it")
+	if _, err := scanExtractJPEG(blob, "fake.cr3"); err == nil {
+		t.Error("expected error for blob with no JPEG, got nil")
 	}
 }
 
@@ -135,7 +168,7 @@ func createTestJPEG(t *testing.T, path string) {
 
 // folderImportBody builds the JSON body for /api/import-from-folder.
 func folderImportBody(sourceDir, destBase string) string {
-	return `{"source_directory":"` + sourceDir + `","destination_base":"` + destBase + `","skip_duplicates":false,"import_raw_files":false}`
+	return `{"source_directory":"` + sourceDir + `","destination_base":"` + destBase + `","skip_duplicates":false}`
 }
 
 // TestFolderImportCustomDestination is the primary integration test for the bug fix:

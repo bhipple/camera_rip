@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +23,6 @@ import (
 	"time"
 
 	"github.com/nfnt/resize"
-	"regexp"
 )
 
 var (
@@ -34,31 +32,12 @@ var (
 	thumbnailSize      = 200
 )
 
-type cameraBrand struct {
-	suffix string // DCIM folder suffix, e.g. "CANON", "OLYMP"
-	rawExt string // RAW file extension including dot, e.g. ".CR3", ".ORF"
-}
-
-var supportedBrands = []cameraBrand{
-	{suffix: "CANON", rawExt: ".CR3"},
-	{suffix: "OLYMP", rawExt: ".ORF"},
-	{suffix: "OMSYS", rawExt: ".ORF"},
-}
-
-func detectCameraBrand(folderName string) *cameraBrand {
-	upper := strings.ToUpper(folderName)
-	for i := range supportedBrands {
-		if strings.HasSuffix(upper, supportedBrands[i].suffix) {
-			return &supportedBrands[i]
-		}
-	}
-	return nil
-}
+var rawExtensions = []string{".cr3", ".orf"}
 
 func isRawFile(name string) bool {
 	lower := strings.ToLower(name)
-	for _, b := range supportedBrands {
-		if strings.HasSuffix(lower, strings.ToLower(b.rawExt)) {
+	for _, ext := range rawExtensions {
+		if strings.HasSuffix(lower, ext) {
 			return true
 		}
 	}
@@ -137,53 +116,41 @@ func tiffExtractJPEG(data []byte) ([]byte, error) {
 	return nil, fmt.Errorf("JPEG offset/length tags not found in TIFF IFDs")
 }
 
-// scanExtractJPEG finds the largest JPEG segment in arbitrary binary data by
-// locating all SOI markers and bounding each segment by the next SOI (or EOF).
-// Used for ISOBMFF-based RAWs (CR3) where TIFF parsing doesn't apply.
+// scanExtractJPEG finds the largest embedded JPEG by trying each FF D8 FF
+// candidate as a JPEG header. Used for ISOBMFF-based RAWs (CR3) where TIFF
+// parsing doesn't apply.
+//
+// We can't bound segments by locating EOI ourselves: CR3 raw sensor data
+// contains random FF D9 byte pairs that look like EOI markers, so any
+// byte-scan approach produces a JPEG with trailing garbage that fails to
+// decode. Instead, validate each SOI with jpeg.DecodeConfig (cheap — header
+// only) and return data[start:]. The caller's jpeg.Decode stops at the real
+// EOI and ignores trailing bytes.
 func scanExtractJPEG(data []byte, rawPath string) ([]byte, error) {
 	soi := []byte{0xFF, 0xD8, 0xFF}
-	eoi := []byte{0xFF, 0xD9}
+	var bestStart = -1
+	var bestArea int
 
-	var starts []int
 	for off := 0; off+3 <= len(data); {
 		idx := bytes.Index(data[off:], soi)
 		if idx < 0 {
 			break
 		}
-		starts = append(starts, off+idx)
-		off = off + idx + 1
+		start := off + idx
+		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data[start:])); err == nil {
+			area := cfg.Width * cfg.Height
+			if area > bestArea {
+				bestArea = area
+				bestStart = start
+			}
+		}
+		off = start + 2
 	}
 
-	var best []byte
-	for i, start := range starts {
-		bound := len(data)
-		if i+1 < len(starts) {
-			bound = starts[i+1]
-		}
-		eoiIdx := bytes.LastIndex(data[start:bound], eoi)
-		if eoiIdx < 3 {
-			continue
-		}
-		seg := data[start : start+eoiIdx+2]
-		if len(seg) > len(best) {
-			best = seg
-		}
-	}
-	if len(best) == 0 {
+	if bestStart < 0 {
 		return nil, fmt.Errorf("no embedded JPEG found in %s", rawPath)
 	}
-	return best, nil
-}
-
-// rawAlreadyExported returns true if a raw file with the given base name (any supported
-// extension) already exists in dir.
-func rawAlreadyExported(dir, baseName string) bool {
-	for _, b := range supportedBrands {
-		if _, err := os.Stat(filepath.Join(dir, baseName+b.rawExt)); err == nil {
-			return true
-		}
-	}
-	return false
+	return data[bestStart:], nil
 }
 
 type spaFileSystem struct {
@@ -223,16 +190,10 @@ func main() {
 	http.HandleFunc("/api/directories", corsHandler(listDirectoriesHandler))
 	http.HandleFunc("/api/photos", corsHandler(getPhotosHandler))
 	http.HandleFunc("/api/save", corsHandler(saveSelectedPhotosHandler))
-	http.HandleFunc("/api/import", corsHandler(importFromUSBHandler))
-	http.HandleFunc("/api/import-preview", corsHandler(importPreviewHandler))
 	http.HandleFunc("/api/import-from-folder", corsHandler(importFromFolderHandler))
 	http.HandleFunc("/api/import-from-folder-preview", corsHandler(importFromFolderPreviewHandler))
 	http.HandleFunc("/api/recent-paths", corsHandler(recentPathsHandler))
-	http.HandleFunc("/api/export-raw", corsHandler(exportRawFilesHandler))
-	http.HandleFunc("/api/export-raw-single", corsHandler(exportRawSingleFileHandler))
-	http.HandleFunc("/api/export-status", corsHandler(exportStatusHandler))
 	http.HandleFunc("/api/selected-photos", corsHandler(getSelectedPhotosHandler))
-	http.HandleFunc("/api/delete-imported", corsHandler(deleteImportedHandler))
 	http.HandleFunc("/api/delete-photos", corsHandler(deletePhotosHandler))
 	http.HandleFunc("/photos/", corsHandler(servePhotoHandler))
 	http.HandleFunc("/thumbnail/", corsHandler(serveThumbnailHandler))
@@ -324,21 +285,15 @@ func getPhotosHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var photos []string
-	var rawFiles []string
 	for _, file := range files {
 		if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
 			lowerName := strings.ToLower(file.Name())
-			if strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") || strings.HasSuffix(lowerName, ".gif") {
+			isImg := strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".jpg") ||
+				strings.HasSuffix(lowerName, ".jpeg") || strings.HasSuffix(lowerName, ".gif")
+			if isImg || isRawFile(file.Name()) {
 				photos = append(photos, file.Name())
-			} else if isRawFile(file.Name()) {
-				rawFiles = append(rawFiles, file.Name())
 			}
 		}
-	}
-
-	// If the folder contains only RAW files (no viewable images), expose the RAWs directly.
-	if len(photos) == 0 {
-		photos = rawFiles
 	}
 
 	sort.Strings(photos)
@@ -377,20 +332,15 @@ func getSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var photos []string
-	var rawFiles []string
 	for _, file := range files {
 		if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
 			lowerName := strings.ToLower(file.Name())
-			if strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") || strings.HasSuffix(lowerName, ".gif") {
+			isImg := strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".jpg") ||
+				strings.HasSuffix(lowerName, ".jpeg") || strings.HasSuffix(lowerName, ".gif")
+			if isImg || isRawFile(file.Name()) {
 				photos = append(photos, file.Name())
-			} else if isRawFile(file.Name()) {
-				rawFiles = append(rawFiles, file.Name())
 			}
 		}
-	}
-
-	if len(photos) == 0 {
-		photos = rawFiles
 	}
 
 	sort.Strings(photos)
@@ -478,787 +428,6 @@ func buildImportedFilesSet() map[string]bool {
 	}
 
 	return importedFiles
-}
-
-func importFromUSBHandler(w http.ResponseWriter, r *http.Request) {
-	var data struct {
-		Since           string `json:"since"`
-		Until           string `json:"until"`
-		SkipDuplicates  bool   `json:"skip_duplicates"`
-		TargetDirectory string `json:"target_directory"`
-		ImportVideos    bool   `json:"import_videos"`
-		ImportRaws      bool   `json:"import_raws"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	var sinceDate time.Time
-	var untilDate time.Time
-	var err error
-	if data.Since != "" {
-		sinceDate, err = time.Parse("2006-01-02", data.Since)
-		if err != nil {
-			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
-			return
-		}
-	}
-	if data.Until != "" {
-		untilDate, err = time.Parse("2006-01-02", data.Until)
-		if err != nil {
-			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
-			return
-		}
-		// Make until date inclusive by adding one day
-		untilDate = untilDate.AddDate(0, 0, 1)
-	}
-
-	usbMountPoint := findUSBMountPoint()
-	if usbMountPoint == "" {
-		http.Error(w, "USB device with a camera DCIM directory (e.g. 100CANON, 100OLYMP) not found. Is it connected?", http.StatusNotFound)
-		return
-	}
-
-	cameraDirs := findCameraDirectories(usbMountPoint)
-	if len(cameraDirs) == 0 {
-		http.Error(w, "Could not find a supported camera DCIM directory on USB device", http.StatusNotFound)
-		return
-	}
-
-	// Determine destination directory: use target if specified, otherwise create new timestamped directory
-	var destinationDir string
-	var isNewBatch bool
-	if data.TargetDirectory != "" {
-		destinationDir = filepath.Join(photoBaseDir, data.TargetDirectory)
-		isNewBatch = false
-		// Verify target directory exists
-		if _, err := os.Stat(destinationDir); os.IsNotExist(err) {
-			http.Error(w, "Target directory does not exist", http.StatusBadRequest)
-			return
-		}
-	} else {
-		destinationDir = filepath.Join(photoBaseDir, time.Now().Format("2006-01-02_15-04-05"))
-		isNewBatch = true
-	}
-
-	destinationDirCreated := !isNewBatch // If adding to existing, directory already exists
-
-	// Read files from all camera DCIM directories, tracking which directory each file came from
-	type fileWithDir struct {
-		file os.FileInfo
-		dir  string
-	}
-	var allFiles []fileWithDir
-	for _, cameraDir := range cameraDirs {
-		sourceDir := filepath.Join(usbMountPoint, "DCIM", cameraDir)
-		files, err := ioutil.ReadDir(sourceDir)
-		if err != nil {
-			log.Printf("Failed to read directory %s: %v", sourceDir, err)
-			continue
-		}
-		for _, file := range files {
-			allFiles = append(allFiles, fileWithDir{file: file, dir: cameraDir})
-		}
-	}
-
-	if len(allFiles) == 0 {
-		http.Error(w, "No files found in camera DCIM directories", http.StatusNotFound)
-		return
-	}
-
-	// Build set of already imported files once (if skip duplicates is enabled)
-	var importedFiles map[string]bool
-	if data.SkipDuplicates {
-		importedFiles = buildImportedFilesSet()
-		log.Printf("Skip duplicates enabled: found %d already imported files", len(importedFiles))
-	}
-
-	copiedCount := 0
-	skippedDuplicates := 0
-	var copiedFiles []string
-	for _, fileEntry := range allFiles {
-		file := fileEntry.file
-		if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
-			lowerName := strings.ToLower(file.Name())
-			// Process .jpg files always, and .mp4/.raw files only if enabled
-			isJpg := strings.HasSuffix(lowerName, ".jpg")
-			isMp4 := strings.HasSuffix(lowerName, ".mp4")
-			isRaw := isRawFile(file.Name())
-
-			if !isJpg && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRaws) {
-				continue
-			}
-
-			sourceDir := filepath.Join(usbMountPoint, "DCIM", fileEntry.dir)
-			sourceFile := filepath.Join(sourceDir, file.Name())
-
-			if !sinceDate.IsZero() || !untilDate.IsZero() {
-				fileInfo, err := os.Stat(sourceFile)
-				if err != nil {
-					log.Printf("Failed to get file info: %v", err)
-					continue
-				}
-				modTime := fileInfo.ModTime()
-				if !sinceDate.IsZero() && modTime.Before(sinceDate) {
-					continue
-				}
-				if !untilDate.IsZero() && !modTime.Before(untilDate) {
-					continue
-				}
-			}
-
-			dirPrefix := getDCIMPrefix(fileEntry.dir)
-			destFilename := file.Name()
-			if dirPrefix != "" {
-				destFilename = dirPrefix + "_" + file.Name()
-			}
-
-			// Check if file has already been imported to any directory (O(1) lookup)
-			if data.SkipDuplicates && importedFiles[destFilename] {
-				skippedDuplicates++
-				continue
-			}
-
-			// Create destination directory on first file to be copied
-			if !destinationDirCreated {
-				if err := os.MkdirAll(destinationDir, 0755); err != nil {
-					log.Printf("Failed to create destination directory: %v", err)
-					http.Error(w, "Could not create destination directory", http.StatusInternalServerError)
-					return
-				}
-				destinationDirCreated = true
-			}
-
-			destinationFile := filepath.Join(destinationDir, destFilename)
-			if _, err := os.Stat(destinationFile); err == nil {
-				continue // Skip if file already exists in current destination
-			}
-
-			source, err := os.Open(sourceFile)
-			if err != nil {
-				log.Printf("Failed to open source file: %v", err)
-				continue
-			}
-			defer source.Close()
-
-			destination, err := os.Create(destinationFile)
-			if err != nil {
-				log.Printf("Failed to create destination file: %v", err)
-				continue
-			}
-			defer destination.Close()
-
-			if _, err := io.Copy(destination, source); err != nil {
-				log.Printf("Failed to copy file: %v", err)
-				continue
-			}
-			copiedCount++
-			if isJpg || isRaw {
-				copiedFiles = append(copiedFiles, destFilename)
-			}
-		}
-	}
-
-	// Handle case where no files were copied
-	if copiedCount == 0 {
-		var message string
-		if !sinceDate.IsZero() || !untilDate.IsZero() {
-			message = "No new files found in the selected date range"
-		} else if skippedDuplicates > 0 {
-			message = "All " + strconv.Itoa(skippedDuplicates) + " files have already been imported."
-		} else {
-			message = "No files found to import."
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"message":       message,
-			"new_directory": nil,
-		})
-		return
-	}
-
-	// Start async thumbnail generation for imported photos
-	dirName := filepath.Base(destinationDir)
-	go func() {
-		log.Printf("Starting background thumbnail generation for imported directory: %s (%d photos)", dirName, len(copiedFiles))
-		preGenerateThumbnails(dirName, copiedFiles)
-	}()
-
-	message := "Successfully copied " + strconv.Itoa(copiedCount) + " new files"
-	if !isNewBatch {
-		message += " to " + dirName
-	}
-	message += "."
-	if skippedDuplicates > 0 {
-		message += " Skipped " + strconv.Itoa(skippedDuplicates) + " already imported."
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	var newDirectory interface{}
-	if isNewBatch {
-		newDirectory = dirName
-	} else {
-		newDirectory = nil
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":       message,
-		"new_directory": newDirectory,
-	})
-}
-
-func importPreviewHandler(w http.ResponseWriter, r *http.Request) {
-	var data struct {
-		Since           string `json:"since"`
-		Until           string `json:"until"`
-		SkipDuplicates  bool   `json:"skip_duplicates"`
-		TargetDirectory string `json:"target_directory"`
-		ImportVideos    bool   `json:"import_videos"`
-		ImportRaws      bool   `json:"import_raws"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	var sinceDate time.Time
-	var untilDate time.Time
-	var err error
-	if data.Since != "" {
-		sinceDate, err = time.Parse("2006-01-02", data.Since)
-		if err != nil {
-			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
-			return
-		}
-	}
-	if data.Until != "" {
-		untilDate, err = time.Parse("2006-01-02", data.Until)
-		if err != nil {
-			http.Error(w, "Invalid date format. Please use YYYY-MM-DD.", http.StatusBadRequest)
-			return
-		}
-		// Make until date inclusive by adding one day
-		untilDate = untilDate.AddDate(0, 0, 1)
-	}
-
-	usbMountPoint := findUSBMountPoint()
-	if usbMountPoint == "" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"total_files":     0,
-			"files_to_import": 0,
-			"files_to_skip":   0,
-			"usb_connected":   false,
-			"error":           "USB device with a camera DCIM directory not found",
-		})
-		return
-	}
-
-	cameraDirs := findCameraDirectories(usbMountPoint)
-	if len(cameraDirs) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"total_files":     0,
-			"files_to_import": 0,
-			"files_to_skip":   0,
-			"usb_connected":   true,
-			"error":           "Could not find supported camera directories on USB device",
-		})
-		return
-	}
-
-	// Determine destination directory for duplicate checking
-	var destinationDir string
-	if data.TargetDirectory != "" {
-		destinationDir = filepath.Join(photoBaseDir, data.TargetDirectory)
-		// Verify target directory exists
-		if _, err := os.Stat(destinationDir); os.IsNotExist(err) {
-			http.Error(w, "Target directory does not exist", http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Read files from all camera DCIM directories
-	type fileWithDir struct {
-		file os.FileInfo
-		dir  string
-	}
-	var allFiles []fileWithDir
-	for _, cameraDir := range cameraDirs {
-		sourceDir := filepath.Join(usbMountPoint, "DCIM", cameraDir)
-		files, err := ioutil.ReadDir(sourceDir)
-		if err != nil {
-			log.Printf("Failed to read directory %s: %v", sourceDir, err)
-			continue
-		}
-		for _, file := range files {
-			allFiles = append(allFiles, fileWithDir{file: file, dir: cameraDir})
-		}
-	}
-
-	// Build set of already imported files once (if skip duplicates is enabled)
-	var importedFiles map[string]bool
-	if data.SkipDuplicates {
-		importedFiles = buildImportedFilesSet()
-	}
-
-	totalFiles := 0
-	filesToImport := 0
-	skippedDuplicates := 0
-	skippedByDate := 0
-	skippedVideos := 0
-	skippedRaws := 0
-	// dailyBreakdown maps "YYYY-MM-DD" -> count of files that will be imported that day
-	dailyBreakdown := make(map[string]int)
-
-	for _, fileEntry := range allFiles {
-		file := fileEntry.file
-		if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
-			lowerName := strings.ToLower(file.Name())
-			isJpg := strings.HasSuffix(lowerName, ".jpg")
-			isMp4 := strings.HasSuffix(lowerName, ".mp4")
-			isRaw := isRawFile(file.Name())
-
-			// Count all potential files
-			if isJpg || isMp4 || isRaw {
-				totalFiles++
-			}
-
-			// Skip if not jpg and not importing videos/raws
-			if !isJpg && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRaws) {
-				if isMp4 {
-					skippedVideos++
-				}
-				if isRaw {
-					skippedRaws++
-				}
-				continue
-			}
-
-			sourceDir := filepath.Join(usbMountPoint, "DCIM", fileEntry.dir)
-			sourceFile := filepath.Join(sourceDir, file.Name())
-
-			// Check date filter (range)
-			var modTime time.Time
-			if !sinceDate.IsZero() || !untilDate.IsZero() {
-				fileInfo, err := os.Stat(sourceFile)
-				if err != nil {
-					skippedByDate++
-					continue
-				}
-				modTime = fileInfo.ModTime()
-				if !sinceDate.IsZero() && modTime.Before(sinceDate) {
-					skippedByDate++
-					continue
-				}
-				if !untilDate.IsZero() && !modTime.Before(untilDate) {
-					skippedByDate++
-					continue
-				}
-			} else {
-				// Still need modTime for daily breakdown
-				if fileInfo, err := os.Stat(sourceFile); err == nil {
-					modTime = fileInfo.ModTime()
-				}
-			}
-
-			dirPrefix := getDCIMPrefix(fileEntry.dir)
-			destFilename := file.Name()
-			if dirPrefix != "" {
-				destFilename = dirPrefix + "_" + file.Name()
-			}
-
-			// Check if already imported
-			if data.SkipDuplicates && importedFiles[destFilename] {
-				skippedDuplicates++
-				continue
-			}
-
-			// Check if file already exists in target destination
-			if destinationDir != "" {
-				destinationFile := filepath.Join(destinationDir, destFilename)
-				if _, err := os.Stat(destinationFile); err == nil {
-					skippedDuplicates++
-					continue
-				}
-			}
-
-			filesToImport++
-			if !modTime.IsZero() {
-				dateKey := modTime.Format("2006-01-02")
-				dailyBreakdown[dateKey]++
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_files":        totalFiles,
-		"files_to_import":    filesToImport,
-		"skipped_duplicates": skippedDuplicates,
-		"skipped_by_date":    skippedByDate,
-		"skipped_videos":     skippedVideos,
-		"skipped_raws":       skippedRaws,
-		"usb_connected":      true,
-		"daily_breakdown":    dailyBreakdown,
-	})
-}
-
-func exportRawFilesHandler(w http.ResponseWriter, r *http.Request) {
-	var data struct {
-		Directory string `json:"directory"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if data.Directory == "" {
-		http.Error(w, "Missing 'directory' in request", http.StatusBadRequest)
-		return
-	}
-
-	// Find USB/SD card mount point
-	usbMountPoint := findUSBMountPoint()
-	if usbMountPoint == "" {
-		http.Error(w, "USB device with a camera DCIM directory (e.g. 100CANON, 100OLYMP) not found. Is the SD card connected?", http.StatusNotFound)
-		return
-	}
-
-	if len(findCameraDirectories(usbMountPoint)) == 0 {
-		http.Error(w, "Could not find a supported camera DCIM directory on USB device", http.StatusNotFound)
-		return
-	}
-
-	sourceDir := filepath.Join(photoBaseDir, data.Directory)
-	selectedDir := filepath.Join(sourceDir, "selected")
-	rawDestDir := filepath.Join(selectedDir, "raw")
-
-	// Check if selected directory exists and has files
-	selectedFiles, err := ioutil.ReadDir(selectedDir)
-	if err != nil {
-		http.Error(w, "Selected directory not found or empty", http.StatusNotFound)
-		return
-	}
-
-	// Filter for JPEG files in selected directory
-	var jpegFiles []string
-	for _, file := range selectedFiles {
-		if !file.IsDir() {
-			lowerName := strings.ToLower(file.Name())
-			if strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") {
-				jpegFiles = append(jpegFiles, file.Name())
-			}
-		}
-	}
-
-	if len(jpegFiles) == 0 {
-		http.Error(w, "No JPEG files found in selected directory", http.StatusNotFound)
-		return
-	}
-
-	// Create raw destination directory
-	if err := os.MkdirAll(rawDestDir, 0755); err != nil {
-		http.Error(w, "Failed to create raw destination directory", http.StatusInternalServerError)
-		return
-	}
-
-	copiedCount := 0
-	skippedCount := 0
-	notFoundCount := 0
-
-	for _, jpegFile := range jpegFiles {
-		ext := filepath.Ext(jpegFile)
-		baseName := strings.TrimSuffix(jpegFile, ext)
-
-		prefix, originalBaseName := splitPrefixedFilename(baseName)
-
-		// Skip if a raw file (any supported extension) is already at destination
-		if rawAlreadyExported(rawDestDir, baseName) {
-			skippedCount++
-			continue
-		}
-
-		rawSourcePath, rawExt, found := findRawForJPG(usbMountPoint, prefix, originalBaseName)
-		if !found {
-			log.Printf("Raw file not found on SD card for %s", originalBaseName)
-			notFoundCount++
-			continue
-		}
-
-		rawDestPath := filepath.Join(rawDestDir, baseName+rawExt)
-
-		// Copy the raw file from SD card
-		source, err := os.Open(rawSourcePath)
-		if err != nil {
-			log.Printf("Failed to open source raw file: %v", err)
-			notFoundCount++
-			continue
-		}
-		defer source.Close()
-
-		destination, err := os.Create(rawDestPath)
-		if err != nil {
-			log.Printf("Failed to create destination raw file: %v", err)
-			continue
-		}
-		defer destination.Close()
-
-		if _, err := io.Copy(destination, source); err != nil {
-			log.Printf("Failed to copy raw file: %v", err)
-			continue
-		}
-		copiedCount++
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":        "Raw file export complete",
-		"copied":         copiedCount,
-		"skipped":        skippedCount,
-		"not_found":      notFoundCount,
-		"total_selected": len(jpegFiles),
-	})
-}
-
-func exportRawSingleFileHandler(w http.ResponseWriter, r *http.Request) {
-	var data struct {
-		Directory string `json:"directory"`
-		Filename  string `json:"filename"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if data.Directory == "" || data.Filename == "" {
-		http.Error(w, "Missing 'directory' or 'filename' in request", http.StatusBadRequest)
-		return
-	}
-
-	// Find USB/SD card mount point
-	usbMountPoint := findUSBMountPoint()
-	if usbMountPoint == "" {
-		http.Error(w, "USB device with a camera DCIM directory (e.g. 100CANON, 100OLYMP) not found. Is the SD card connected?", http.StatusNotFound)
-		return
-	}
-
-	sourceDir := filepath.Join(photoBaseDir, data.Directory)
-	selectedDir := filepath.Join(sourceDir, "selected")
-	rawDestDir := filepath.Join(selectedDir, "raw")
-
-	// Create raw destination directory
-	if err := os.MkdirAll(rawDestDir, 0755); err != nil {
-		http.Error(w, "Failed to create raw destination directory", http.StatusInternalServerError)
-		return
-	}
-
-	// Get the base filename without extension
-	ext := filepath.Ext(data.Filename)
-	baseName := strings.TrimSuffix(data.Filename, ext)
-
-	prefix, originalBaseName := splitPrefixedFilename(baseName)
-
-	// Skip if a raw file (any supported extension) is already at destination
-	if rawAlreadyExported(rawDestDir, baseName) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"message": "Raw file already exported",
-			"status":  "skipped",
-		})
-		return
-	}
-
-	rawSourcePath, rawExt, found := findRawForJPG(usbMountPoint, prefix, originalBaseName)
-	if !found {
-		http.Error(w, "Raw file not found on SD card", http.StatusNotFound)
-		return
-	}
-
-	rawDestPath := filepath.Join(rawDestDir, baseName+rawExt)
-
-	// Copy the raw file from SD card
-	source, err := os.Open(rawSourcePath)
-	if err != nil {
-		log.Printf("Failed to open source raw file: %v", err)
-		http.Error(w, "Failed to open source raw file", http.StatusInternalServerError)
-		return
-	}
-	defer source.Close()
-
-	destination, err := os.Create(rawDestPath)
-	if err != nil {
-		log.Printf("Failed to create destination raw file: %v", err)
-		http.Error(w, "Failed to create destination raw file", http.StatusInternalServerError)
-		return
-	}
-	defer destination.Close()
-
-	if _, err := io.Copy(destination, source); err != nil {
-		log.Printf("Failed to copy raw file: %v", err)
-		http.Error(w, "Failed to copy raw file", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "Raw file export complete",
-		"status":  "copied",
-	})
-}
-
-func exportStatusHandler(w http.ResponseWriter, r *http.Request) {
-	directory := r.URL.Query().Get("directory")
-	if directory == "" {
-		http.Error(w, "Missing 'directory' query parameter", http.StatusBadRequest)
-		return
-	}
-
-	sourceDir := resolvePhotoDir(directory)
-	selectedDir := filepath.Join(sourceDir, "selected")
-	rawDir := filepath.Join(selectedDir, "raw")
-
-	// Count JPEG files in selected directory
-	selectedCount := 0
-	var jpegFiles []string
-	if files, err := ioutil.ReadDir(selectedDir); err == nil {
-		for _, file := range files {
-			if !file.IsDir() {
-				lowerName := strings.ToLower(file.Name())
-				if strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") {
-					selectedCount++
-					jpegFiles = append(jpegFiles, file.Name())
-				}
-			}
-		}
-	}
-
-	// Count raw files in raw directory (any supported extension)
-	rawCount := 0
-	rawBaseSet := make(map[string]bool)
-	if files, err := ioutil.ReadDir(rawDir); err == nil {
-		for _, file := range files {
-			if !file.IsDir() && isRawFile(file.Name()) {
-				rawCount++
-				base := strings.TrimSuffix(file.Name(), filepath.Ext(file.Name()))
-				rawBaseSet[strings.ToLower(base)] = true
-			}
-		}
-	}
-
-	// Calculate missing raw files
-	missingCount := 0
-	for _, jpegFile := range jpegFiles {
-		base := strings.TrimSuffix(jpegFile, filepath.Ext(jpegFile))
-		if !rawBaseSet[strings.ToLower(base)] {
-			missingCount++
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"selected_count": selectedCount,
-		"raw_count":      rawCount,
-		"missing_count":  missingCount,
-	})
-}
-
-func deleteImportedHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Find USB/SD card mount point
-	usbMountPoint := findUSBMountPoint()
-	if usbMountPoint == "" {
-		http.Error(w, "USB device with a camera DCIM directory (e.g. 100CANON, 100OLYMP) not found. Is it connected?", http.StatusNotFound)
-		return
-	}
-
-	cameraDirs := findCameraDirectories(usbMountPoint)
-	if len(cameraDirs) == 0 {
-		http.Error(w, "Could not find a supported camera DCIM directory on USB device", http.StatusNotFound)
-		return
-	}
-
-	// Build set of imported files using the same logic as the import handler
-	importedFiles := buildImportedFilesSet()
-	log.Printf("Delete imported: found %d already imported files", len(importedFiles))
-
-	deletedCount := 0
-	deletedRawCount := 0
-	notFoundCount := 0
-	errorCount := 0
-
-	// Process files from all camera DCIM directories
-	for _, cameraDir := range cameraDirs {
-		sourceDir := filepath.Join(usbMountPoint, "DCIM", cameraDir)
-		files, err := ioutil.ReadDir(sourceDir)
-		if err != nil {
-			log.Printf("Failed to read directory %s: %v", sourceDir, err)
-			continue
-		}
-
-		for _, file := range files {
-			if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
-				lowerName := strings.ToLower(file.Name())
-				// Process both .jpg and .mp4 files
-				isJpg := strings.HasSuffix(lowerName, ".jpg")
-				isMp4 := strings.HasSuffix(lowerName, ".mp4")
-				if !isJpg && !isMp4 {
-					continue
-				}
-
-				dirPrefix := getDCIMPrefix(cameraDir)
-				destFilename := file.Name()
-				if dirPrefix != "" {
-					destFilename = dirPrefix + "_" + file.Name()
-				}
-
-				// Only delete files that are in the imported set
-				if importedFiles[destFilename] {
-					filePath := filepath.Join(sourceDir, file.Name())
-					if err := os.Remove(filePath); err == nil {
-						deletedCount++
-						log.Printf("Deleted imported file: %s", file.Name())
-
-						// If it's a JPG, also try to delete the associated RAW file
-						if isJpg {
-							baseName := strings.TrimSuffix(file.Name(), filepath.Ext(file.Name()))
-							if brand := detectCameraBrand(cameraDir); brand != nil {
-								rawFilePath := filepath.Join(sourceDir, baseName+brand.rawExt)
-								if err := os.Remove(rawFilePath); err == nil {
-									deletedRawCount++
-									log.Printf("Deleted associated RAW file: %s", baseName+brand.rawExt)
-								}
-							}
-						}
-					} else {
-						if os.IsNotExist(err) {
-							notFoundCount++
-						} else {
-							log.Printf("Failed to delete file %s: %v", filePath, err)
-							errorCount++
-						}
-					}
-				}
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":     "Delete operation complete",
-		"deleted":     deletedCount,
-		"deleted_raw": deletedRawCount,
-		"not_found":   notFoundCount,
-		"errors":      errorCount,
-		"total_found": deletedCount + deletedRawCount + notFoundCount + errorCount,
-	})
 }
 
 func deletePhotosHandler(w http.ResponseWriter, r *http.Request) {
@@ -1500,7 +669,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 		SkipDuplicates  bool   `json:"skip_duplicates"`
 		TargetDirectory string `json:"target_directory"`
 		ImportVideos    bool   `json:"import_videos"`
-		ImportRawFiles  bool   `json:"import_raw_files"`
 		Recursive       bool   `json:"recursive"`
 	}
 
@@ -1592,7 +760,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 	skippedDuplicates := 0
 	skippedByDate := 0
 	skippedVideos := 0
-	skippedRawFiles := 0
 	dailyBreakdown := make(map[string]int)
 
 	for _, file := range allFiles {
@@ -1608,12 +775,9 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 			totalFiles++
 		}
 
-		if !isImage && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRawFiles) {
+		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
 			if isMp4 {
 				skippedVideos++
-			}
-			if isRaw {
-				skippedRawFiles++
 			}
 			continue
 		}
@@ -1656,7 +820,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 		"skipped_duplicates": skippedDuplicates,
 		"skipped_by_date":    skippedByDate,
 		"skipped_videos":     skippedVideos,
-		"skipped_raw_files":  skippedRawFiles,
 		"daily_breakdown":    dailyBreakdown,
 	})
 }
@@ -1670,7 +833,6 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		SkipDuplicates  bool   `json:"skip_duplicates"`
 		TargetDirectory string `json:"target_directory"`
 		ImportVideos    bool   `json:"import_videos"`
-		ImportRawFiles  bool   `json:"import_raw_files"`
 		Recursive       bool   `json:"recursive"`
 	}
 
@@ -1796,7 +958,7 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 			strings.HasSuffix(lowerName, ".arw") || strings.HasSuffix(lowerName, ".nef") ||
 			strings.HasSuffix(lowerName, ".raf") || strings.HasSuffix(lowerName, ".dng")
 
-		if !isImage && (!isMp4 || !data.ImportVideos) && (!isRaw || !data.ImportRawFiles) {
+		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
 			continue
 		}
 
@@ -1970,105 +1132,6 @@ func extractRawPreview(directory, filename string) (string, error) {
 	return previewPath, nil
 }
 
-// findCameraDirectories returns DCIM subdirectories whose suffix matches a supported brand
-// (e.g. 100CANON, 101CANON, 100OLYMP).
-func findCameraDirectories(mountPoint string) []string {
-	var dirs []string
-	dcimPath := filepath.Join(mountPoint, "DCIM")
-	files, err := ioutil.ReadDir(dcimPath)
-	if err != nil {
-		return dirs
-	}
-
-	re := regexp.MustCompile(`^[0-9]{3}`)
-	for _, file := range files {
-		if file.IsDir() && re.MatchString(file.Name()) && detectCameraBrand(file.Name()) != nil {
-			dirs = append(dirs, file.Name())
-		}
-	}
-	return dirs
-}
-
-func findCameraDirectory(mountPoint string) string {
-	dirs := findCameraDirectories(mountPoint)
-	if len(dirs) > 0 {
-		return dirs[0]
-	}
-	return ""
-}
-
-// findRawForJPG locates the RAW file on the camera card matching the given JPG base name.
-// It prefers a DCIM folder whose 3-digit prefix matches the JPG's prefix, and falls back to
-// scanning all camera folders.
-func findRawForJPG(mountPoint, prefix, originalBaseName string) (rawPath, rawExt string, found bool) {
-	cameraDirs := findCameraDirectories(mountPoint)
-
-	check := func(dir string) (string, string, bool) {
-		brand := detectCameraBrand(dir)
-		if brand == nil {
-			return "", "", false
-		}
-		candidate := filepath.Join(mountPoint, "DCIM", dir, originalBaseName+brand.rawExt)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, brand.rawExt, true
-		}
-		return "", "", false
-	}
-
-	if prefix != "" {
-		for _, dir := range cameraDirs {
-			if !strings.HasPrefix(dir, prefix) {
-				continue
-			}
-			if path, ext, ok := check(dir); ok {
-				return path, ext, true
-			}
-		}
-	}
-
-	for _, dir := range cameraDirs {
-		if path, ext, ok := check(dir); ok {
-			return path, ext, true
-		}
-	}
-
-	return "", "", false
-}
-
-func findUSBMountPoint() string {
-	switch runtime.GOOS {
-	case "darwin":
-		volumesDir := "/Volumes"
-		dirs, err := ioutil.ReadDir(volumesDir)
-		if err != nil {
-			return ""
-		}
-		for _, dir := range dirs {
-			if dir.IsDir() {
-				mountPoint := filepath.Join(volumesDir, dir.Name())
-				if findCameraDirectory(mountPoint) != "" {
-					return mountPoint
-				}
-			}
-		}
-	case "linux":
-		mediaDir := filepath.Join("/media", os.Getenv("USER"))
-		dirs, err := ioutil.ReadDir(mediaDir)
-		if err != nil {
-			return ""
-		}
-		for _, dir := range dirs {
-			if dir.IsDir() {
-				mountPoint := filepath.Join(mediaDir, dir.Name())
-				if findCameraDirectory(mountPoint) != "" {
-					return mountPoint
-				}
-			}
-		}
-	}
-	return ""
-}
-
 func generateThumbnail(directory, filename string) error {
 	thumbnailDir := filepath.Join(thumbnailCacheDir, directoryCacheKey(directory))
 	thumbnailPath := filepath.Join(thumbnailDir, filename)
@@ -2213,24 +1276,4 @@ func serveThumbnailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.ServeFile(w, r, thumbnailPath)
-}
-
-func getDCIMPrefix(dir string) string {
-	if len(dir) >= 3 {
-		prefix := dir[:3]
-		if _, err := strconv.Atoi(prefix); err == nil {
-			return prefix
-		}
-	}
-	return ""
-}
-
-func splitPrefixedFilename(filename string) (prefix string, originalName string) {
-	if len(filename) > 4 && filename[3] == '_' {
-		p := filename[:3]
-		if _, err := strconv.Atoi(p); err == nil {
-			return p, filename[4:]
-		}
-	}
-	return "", filename
 }

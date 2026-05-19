@@ -21,12 +21,7 @@ function App() {
     const [skipDuplicates, setSkipDuplicates] = useState(true);
     const [addToCurrentBatch, setAddToCurrentBatch] = useState(false);
     const [importVideos, setImportVideos] = useState(false);
-    const [importRaws, setImportRaws] = useState(false);
     const [pinnedPhoto, setPinnedPhoto] = useState(null);
-    const [exportStatus, setExportStatus] = useState({ selected_count: 0, raw_count: 0, missing_count: 0 });
-    const [isExportingRaw, setIsExportingRaw] = useState(false);
-    const [showDeleteModal, setShowDeleteModal] = useState(false);
-    const [isDeleting, setIsDeleting] = useState(false);
     const [showDeletePhotosModal, setShowDeletePhotosModal] = useState(false);
     const [isDeletingPhotos, setIsDeletingPhotos] = useState(false);
     const [carouselFilter, setCarouselFilter] = useState('all');
@@ -36,11 +31,9 @@ function App() {
     const currentPhotoNameRef = useRef(null);
     const [importPreview, setImportPreview] = useState(null);
     const [isLoadingPreview, setIsLoadingPreview] = useState(false);
-    const [importMode, setImportMode] = useState('camera');
     const [sourceDirectory, setSourceDirectory] = useState('');
     const [destinationBase, setDestinationBase] = useState('');
     const [recursiveScan, setRecursiveScan] = useState(false);
-    const [importRawFiles, setImportRawFiles] = useState(false);
     const [recentSourcePaths, setRecentSourcePaths] = useState([]);
     const [recentDestPaths, setRecentDestPaths] = useState([]);
     const [isFullScreen, setIsFullScreen] = useState(false);
@@ -57,21 +50,6 @@ function App() {
                 }
             })
             .catch(err => toast.error("Error fetching directories."));
-    }, [currentDirectory]);
-
-    const fetchExportStatus = useCallback(() => {
-        if (!currentDirectory) return;
-        fetch(`${API_URL}/api/export-status?directory=${encodeURIComponent(currentDirectory)}`)
-            .then(res => res.json())
-            .then(data => {
-                if (data && !data.error) {
-                    setExportStatus(data);
-                }
-            })
-            .catch(err => {
-                // Silently fail - directory might not have a selected folder yet
-                setExportStatus({ selected_count: 0, raw_count: 0, missing_count: 0 });
-            });
     }, [currentDirectory]);
 
     useEffect(() => {
@@ -92,16 +70,10 @@ function App() {
     const fetchImportPreview = useCallback(async () => {
         setIsLoadingPreview(true);
         try {
-            const endpoint = importMode === 'camera' ? '/api/import-preview' : '/api/import-from-folder-preview';
-            const body = importMode === 'camera'
-                ? {
-                    since: sinceDate,
-                    until: untilDate,
-                    skip_duplicates: skipDuplicates,
-                    target_directory: addToCurrentBatch ? currentDirectory : '',
-                    import_videos: importVideos
-                }
-                : {
+            const response = await fetch(`${API_URL}/api/import-from-folder-preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
                     source_directory: sourceDirectory,
                     destination_base: destinationBase,
                     since: sinceDate,
@@ -109,16 +81,8 @@ function App() {
                     skip_duplicates: skipDuplicates,
                     target_directory: addToCurrentBatch ? currentDirectory : '',
                     import_videos: importVideos,
-                    import_raw_files: importRawFiles,
-                    recursive: recursiveScan
-                };
-
-            const response = await fetch(`${API_URL}${endpoint}`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(body)
+                    recursive: recursiveScan,
+                }),
             });
             const data = await response.json();
             if (response.ok) {
@@ -130,7 +94,7 @@ function App() {
             setImportPreview(null);
         }
         setIsLoadingPreview(false);
-    }, [importMode, sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase, recursiveScan, importRawFiles]);
+    }, [sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase, recursiveScan]);
 
     useEffect(() => {
         fetchImportPreview();
@@ -138,30 +102,20 @@ function App() {
 
     const handleImport = async () => {
         setIsImporting(true);
-        const toastId = toast.loading(importMode === 'camera' ? "Importing from USB..." : "Importing from folder...");
+        const toastId = toast.loading("Importing from folder...");
         try {
-            const endpoint = importMode === 'camera' ? '/api/import' : '/api/import-from-folder';
-            const body = importMode === 'camera'
-                ? {
-                    since: sinceDate,
-                    until: untilDate,
-                    skip_duplicates: skipDuplicates,
-                    target_directory: addToCurrentBatch ? currentDirectory : '',
-                    import_videos: importVideos
-                }
-                : {
-                    source_directory: sourceDirectory,
-                    destination_base: destinationBase,
-                    since: sinceDate,
-                    until: untilDate,
-                    skip_duplicates: skipDuplicates,
-                    target_directory: addToCurrentBatch ? currentDirectory : '',
-                    import_videos: importVideos,
-                    import_raw_files: importRawFiles,
-                    recursive: recursiveScan
-                };
+            const body = {
+                source_directory: sourceDirectory,
+                destination_base: destinationBase,
+                since: sinceDate,
+                until: untilDate,
+                skip_duplicates: skipDuplicates,
+                target_directory: addToCurrentBatch ? currentDirectory : '',
+                import_videos: importVideos,
+                recursive: recursiveScan,
+            };
 
-            const response = await fetch(`${API_URL}${endpoint}`, {
+            const response = await fetch(`${API_URL}/api/import-from-folder`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -226,8 +180,7 @@ function App() {
                 setDeletedPhotos(new Set());
             });
 
-        fetchExportStatus();
-    }, [currentDirectory, fetchExportStatus]);
+    }, [currentDirectory]);
 
     const handleSelection = useCallback((photoName, select) => {
         if (savedPhotos.has(photoName)) {
@@ -294,61 +247,11 @@ function App() {
                     // Move selected to saved and clear selected
                     setSavedPhotos(new Set(allFilesToSave));
                     setSelectedPhotos(new Set());
-                    fetchExportStatus(); // Update export status after save
                 }
             })
             .catch(err => {
                 toast.update(toastId, { render: "An error occurred while saving.", type: "error", isLoading: false, autoClose: 5000 });
             });
-    };
-
-    const handleExportRaw = async () => {
-        setIsExportingRaw(true);
-        const toastId = toast.loading("Exporting raw files...");
-        try {
-            const response = await fetch(`${API_URL}/api/export-raw`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ directory: currentDirectory })
-            });
-            const data = await response.json();
-            if (response.ok) {
-                const message = `Exported ${data.copied} raw files (${data.skipped} already existed, ${data.not_found} not found)`;
-                toast.update(toastId, { render: message, type: "success", isLoading: false, autoClose: 5000 });
-                fetchExportStatus(); // Update export status after export
-            } else {
-                toast.update(toastId, { render: data.error || 'An unknown error occurred.', type: "error", isLoading: false, autoClose: 5000 });
-            }
-        } catch (err) {
-            toast.update(toastId, { render: "Failed to export raw files.", type: "error", isLoading: false, autoClose: 5000 });
-        }
-        setIsExportingRaw(false);
-    };
-
-    const handleDeleteImported = async () => {
-        setIsDeleting(true);
-        setShowDeleteModal(false);
-        const toastId = toast.loading("Deleting imported images from USB...");
-        try {
-            const response = await fetch(`${API_URL}/api/delete-imported`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                }
-            });
-            const data = await response.json();
-            if (response.ok) {
-                const message = `Deleted ${data.deleted} imported files${data.deleted_raw ? ` and ${data.deleted_raw} RAW files` : ''} from USB${data.errors > 0 ? ` (${data.errors} errors)` : ''}`;
-                toast.update(toastId, { render: message, type: "success", isLoading: false, autoClose: 5000 });
-            } else {
-                toast.update(toastId, { render: data.error || 'An unknown error occurred.', type: "error", isLoading: false, autoClose: 5000 });
-            }
-        } catch (err) {
-            toast.update(toastId, { render: "Failed to delete imported images.", type: "error", isLoading: false, autoClose: 5000 });
-        }
-        setIsDeleting(false);
     };
 
     const handleDeletePhotos = async () => {
@@ -652,16 +555,6 @@ function App() {
                 </div>
             )}
             <ConfirmModal
-                isOpen={showDeleteModal}
-                onClose={() => setShowDeleteModal(false)}
-                onConfirm={handleDeleteImported}
-                title="Delete Imported Images"
-                message="This will permanently delete all imported images from the USB/SD card. Only files that have been imported to your computer will be deleted. This action cannot be undone. Are you sure you want to continue?"
-                confirmText="Delete"
-                cancelText="Cancel"
-                confirmButtonClass="delete-confirm"
-            />
-            <ConfirmModal
                 isOpen={showDeletePhotosModal}
                 onClose={() => setShowDeletePhotosModal(false)}
                 onConfirm={handleDeletePhotos}
@@ -690,89 +583,53 @@ function App() {
                         </div>
                     )}
 
-                    {/* Import Mode Toggle */}
-                    <div className="import-mode-toggle">
-                        <label>
+                    {/* Import Controls */}
+                    <div className="folder-import-controls">
+                        <div className="directory-input-group">
+                            <label htmlFor="source-directory">Source:</label>
                             <input
-                                type="radio"
-                                name="importMode"
-                                value="camera"
-                                checked={importMode === 'camera'}
-                                onChange={e => setImportMode(e.target.value)}
+                                type="text"
+                                id="source-directory"
+                                list="recent-source-paths"
+                                value={sourceDirectory}
+                                onChange={e => setSourceDirectory(e.target.value)}
+                                placeholder="/path/to/source"
+                                className="directory-input"
                             />
-                            <span>Camera Mode</span>
-                        </label>
-                        <label>
-                            <input
-                                type="radio"
-                                name="importMode"
-                                value="folder"
-                                checked={importMode === 'folder'}
-                                onChange={e => setImportMode(e.target.value)}
-                            />
-                            <span>Folder Mode</span>
-                        </label>
-                    </div>
-
-                    {/* Folder Mode Controls */}
-                    {importMode === 'folder' && (
-                        <div className="folder-import-controls">
-                            <div className="directory-input-group">
-                                <label htmlFor="source-directory">Source:</label>
-                                <input
-                                    type="text"
-                                    id="source-directory"
-                                    list="recent-source-paths"
-                                    value={sourceDirectory}
-                                    onChange={e => setSourceDirectory(e.target.value)}
-                                    placeholder="/path/to/source"
-                                    className="directory-input"
-                                />
-                                <datalist id="recent-source-paths">
-                                    {recentSourcePaths.map((path, idx) => (
-                                        <option key={idx} value={path} />
-                                    ))}
-                                </datalist>
-                            </div>
-                            <div className="directory-input-group">
-                                <label htmlFor="destination-base">Destination:</label>
-                                <input
-                                    type="text"
-                                    id="destination-base"
-                                    list="recent-dest-paths"
-                                    value={destinationBase}
-                                    onChange={e => setDestinationBase(e.target.value)}
-                                    placeholder="~/Pictures/photos (default)"
-                                    className="directory-input"
-                                />
-                                <datalist id="recent-dest-paths">
-                                    {recentDestPaths.map((path, idx) => (
-                                        <option key={idx} value={path} />
-                                    ))}
-                                </datalist>
-                            </div>
-                            <div className="checkbox-container">
-                                <label>
-                                    <input
-                                        type="checkbox"
-                                        checked={recursiveScan}
-                                        onChange={e => setRecursiveScan(e.target.checked)}
-                                    />
-                                    <span>Scan subdirectories</span>
-                                </label>
-                            </div>
-                            <div className="checkbox-container">
-                                <label>
-                                    <input
-                                        type="checkbox"
-                                        checked={importRawFiles}
-                                        onChange={e => setImportRawFiles(e.target.checked)}
-                                    />
-                                    <span>Import raw files (.CR3, .CR2, etc.)</span>
-                                </label>
-                            </div>
+                            <datalist id="recent-source-paths">
+                                {recentSourcePaths.map((path, idx) => (
+                                    <option key={idx} value={path} />
+                                ))}
+                            </datalist>
                         </div>
-                    )}
+                        <div className="directory-input-group">
+                            <label htmlFor="destination-base">Destination:</label>
+                            <input
+                                type="text"
+                                id="destination-base"
+                                list="recent-dest-paths"
+                                value={destinationBase}
+                                onChange={e => setDestinationBase(e.target.value)}
+                                placeholder="~/Pictures/photos (default)"
+                                className="directory-input"
+                            />
+                            <datalist id="recent-dest-paths">
+                                {recentDestPaths.map((path, idx) => (
+                                    <option key={idx} value={path} />
+                                ))}
+                            </datalist>
+                        </div>
+                        <div className="checkbox-container">
+                            <label>
+                                <input
+                                    type="checkbox"
+                                    checked={recursiveScan}
+                                    onChange={e => setRecursiveScan(e.target.checked)}
+                                />
+                                <span>Scan subdirectories</span>
+                            </label>
+                        </div>
+                    </div>
 
                     <button onClick={handleImport} disabled={isImporting} className="import-button">
                         {isImporting ? 'Importing...' : 'Import'}
@@ -832,23 +689,13 @@ function App() {
                             <span>Import videos (.MP4)</span>
                         </label>
                     </div>
-                    <div className="checkbox-container">
-                        <label>
-                            <input
-                                type="checkbox"
-                                checked={importRaws}
-                                onChange={e => setImportRaws(e.target.checked)}
-                            />
-                            <span>Import RAWs (.CR3, .ORF)</span>
-                        </label>
-                    </div>
 
                     {/* Import Preview */}
                     {isLoadingPreview ? (
                         <div className="import-preview loading">
                             <p>Loading preview...</p>
                         </div>
-                    ) : importPreview && (importMode === 'folder' || importPreview.usb_connected) ? (
+                    ) : importPreview ? (
                         <div className="import-preview">
                             {importPreview.error ? (
                                 <p className="preview-error">{importPreview.error}</p>
@@ -888,22 +735,12 @@ function App() {
                                             <span className="preview-value">{importPreview.skipped_videos}</span>
                                         </div>
                                     )}
-                                    {importPreview.skipped_raw_files > 0 && (
-                                        <div className="preview-stat">
-                                            <span className="preview-label">Will skip (raw files):</span>
-                                            <span className="preview-value">{importPreview.skipped_raw_files}</span>
-                                        </div>
-                                    )}
                                     <div className="preview-stat">
-                                        <span className="preview-label">{importMode === 'camera' ? 'Total on USB:' : 'Total in folder:'}</span>
+                                        <span className="preview-label">Total in folder:</span>
                                         <span className="preview-value">{importPreview.total_files}</span>
                                     </div>
                                 </>
                             )}
-                        </div>
-                    ) : importMode === 'camera' ? (
-                        <div className="import-preview error">
-                            <p>USB not detected</p>
                         </div>
                     ) : null}
                 </div>
@@ -920,13 +757,6 @@ function App() {
                             ))}
                         </select>
                     )}
-                    <button
-                        onClick={() => setShowDeleteModal(true)}
-                        disabled={isDeleting}
-                        className="delete-button"
-                    >
-                        {isDeleting ? 'Deleting...' : 'Delete Already Imported from SD Card'}
-                    </button>
                 </div>
             </div>
 
@@ -1076,7 +906,7 @@ function App() {
                     <div className="welcome-message">
                         <h1>Photo Selector</h1>
                         <p>No photo directories found in <code>~/Pictures/photos</code>.</p>
-                        <p>Connect a camera and use the Import button below to get started.</p>
+                        <p>Use the Import controls to import photos from a folder.</p>
                     </div>
                 )}
 
@@ -1112,12 +942,6 @@ function App() {
                     <button onClick={handleSave} disabled={selectedPhotos.size === 0} className="save-button">
                         Save {selectedPhotos.size} new selections
                     </button>
-                    <button
-                        onClick={handleExportRaw}
-                        disabled={exportStatus.selected_count === 0 || isExportingRaw}
-                        className="export-raw-button">
-                        {isExportingRaw ? 'Exporting...' : `Export Raw Files (${exportStatus.missing_count} missing)`}
-                    </button>
                     {carouselFilter === 'deleted' && deletedPhotos.size > 0 && (
                         <button
                             onClick={() => setShowDeletePhotosModal(true)}
@@ -1129,11 +953,6 @@ function App() {
                 </div>
                 <div className="instructions">
                     <p>Use 's' to select, 'x' to unselect, 'd' to mark for deletion, 'h' to pin/unpin, and 'f' for fullscreen. In fullscreen: 'c' to copy to clipboard, double-click or ↑/↓ arrows to zoom. Press 'Escape' to exit.</p>
-                    {exportStatus.selected_count > 0 && (
-                        <p className="export-status">
-                            Export Status: {exportStatus.selected_count} selected JPEGs, {exportStatus.raw_count} raw files exported, {exportStatus.missing_count} missing
-                        </p>
-                    )}
                 </div>
             </main>
 
