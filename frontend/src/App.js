@@ -34,7 +34,11 @@ function App() {
     const [savedPhotos, setSavedPhotos] = useState(new Set());
     const [deletedPhotos, setDeletedPhotos] = useState(new Set());
     const [isImporting, setIsImporting] = useState(false);
-    const [sinceDate, setSinceDate] = useState('');
+    const [sinceDate, setSinceDate] = useState(() => {
+        const d = new Date();
+        d.setDate(d.getDate() - 14);
+        return d.toISOString().slice(0, 10);
+    });
     const [untilDate, setUntilDate] = useState('');
     const [skipDuplicates, setSkipDuplicates] = useState(true);
     const [addToCurrentBatch, setAddToCurrentBatch] = useState(false);
@@ -49,8 +53,8 @@ function App() {
     const currentPhotoNameRef = useRef(null);
     const [importPreview, setImportPreview] = useState(null);
     const [isLoadingPreview, setIsLoadingPreview] = useState(false);
-    const [sourceDirectory, setSourceDirectory] = useState('');
-    const [destinationBase, setDestinationBase] = useState('');
+    const [sourceDirectory, setSourceDirectory] = useState('/home/bhipple/syncthing/canon_raw');
+    const [destinationBase, setDestinationBase] = useState('/home/bhipple/syncthing/canon_filtered');
     const [recentSourcePaths, setRecentSourcePaths] = useState([]);
     const [recentDestPaths, setRecentDestPaths] = useState([]);
     const [isFullScreen, setIsFullScreen] = useState(false);
@@ -603,63 +607,6 @@ function App() {
                     {isSidebarCollapsed ? '→' : '←'}
                 </button>
                 <div className="sidebar-controls">
-                    {filteredPhotos.length > 0 && currentPhotoName && (
-                        <div className="photo-info-sidebar">
-                            <div className="info-header">
-                                <span className="info-position">{currentIndex + 1} / {filteredPhotos.length}</span>
-                                <span className={`status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
-                                    {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
-                                </span>
-                            </div>
-                            {photoInfo && (
-                                <div className="exif-rows">
-                                    {photoInfo.date_taken && (() => {
-                                        const fmt = formatExifDate(photoInfo.date_taken);
-                                        return fmt ? (
-                                            <div className="exif-row">
-                                                <span className="exif-icon">📅</span>
-                                                <div className="exif-content">
-                                                    <div className="exif-primary">{fmt.date}</div>
-                                                    <div className="exif-secondary">{fmt.time}</div>
-                                                </div>
-                                            </div>
-                                        ) : null;
-                                    })()}
-                                    {photoInfo.camera_model && (
-                                        <div className="exif-row">
-                                            <span className="exif-icon">📷</span>
-                                            <div className="exif-content">
-                                                <div className="exif-primary">{photoInfo.camera_model}</div>
-                                                <div className="exif-secondary">
-                                                    {[
-                                                        photoInfo.f_number,
-                                                        photoInfo.shutter_speed,
-                                                        photoInfo.focal_length,
-                                                        photoInfo.iso ? `ISO${photoInfo.iso}` : null,
-                                                    ].filter(Boolean).join('  ')}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                    <div className="exif-row">
-                                        <span className="exif-icon">🖼️</span>
-                                        <div className="exif-content">
-                                            <div className="exif-primary">{photoInfo.filename}</div>
-                                            <div className="exif-secondary">
-                                                {[
-                                                    photoInfo.megapixels,
-                                                    (photoInfo.width && photoInfo.height)
-                                                        ? `${photoInfo.width} × ${photoInfo.height}`
-                                                        : null,
-                                                ].filter(Boolean).join('  ')}
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    )}
-
                     {/* Import Controls */}
                     <div className="folder-import-controls">
                         <div className="directory-input-group">
@@ -876,29 +823,33 @@ function App() {
                             </div>
                         ) : (
                             <>
-                                {filteredPhotos.length > 0 ? (
-                                    <div className="main-photo-area">
-                                        {currentPhotoName && (
-                                            <div className="photo-filename-overlay">
-                                                <div className="filename">{currentPhotoName}</div>
-                                                <div className="photo-position-overlay">{currentIndex + 1} / {filteredPhotos.length}</div>
-                                            </div>
-                                        )}
-                                        {pinnedPhoto ? (
-                                            <div className="comparison-container">
-                                                <PhotoViewer
-                                                    photoName={pinnedPhoto}
-                                                    directory={currentDirectory}
-                                                    isSelected={isPinnedSelected}
-                                                    isSaved={isPinnedSaved}
-                                                    isDeleted={isPinnedDeleted}
-                                                >
-                                                    <p>{pinnedPhoto}</p>
-                                                    <p className={`status ${isPinnedSaved ? 'status-saved' : (isPinnedSelected ? 'status-selected' : (isPinnedDeleted ? 'status-deleted' : ''))}`}>
-                                                        {isPinnedSaved ? 'SAVED' : (isPinnedSelected ? 'SELECTED' : (isPinnedDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
-                                                    </p>
-                                                    <p className="status status-pinned">PINNED</p>
-                                                </PhotoViewer>
+                                <div className="photo-view-row">
+                                    {filteredPhotos.length > 0 ? (
+                                        <div className="main-photo-area">
+                                            {pinnedPhoto ? (
+                                                <div className="comparison-container">
+                                                    <PhotoViewer
+                                                        photoName={pinnedPhoto}
+                                                        directory={currentDirectory}
+                                                        isSelected={isPinnedSelected}
+                                                        isSaved={isPinnedSaved}
+                                                        isDeleted={isPinnedDeleted}
+                                                    >
+                                                        <p>{pinnedPhoto}</p>
+                                                        <p className={`status ${isPinnedSaved ? 'status-saved' : (isPinnedSelected ? 'status-selected' : (isPinnedDeleted ? 'status-deleted' : ''))}`}>
+                                                            {isPinnedSaved ? 'SAVED' : (isPinnedSelected ? 'SELECTED' : (isPinnedDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                                                        </p>
+                                                        <p className="status status-pinned">PINNED</p>
+                                                    </PhotoViewer>
+                                                    <PhotoViewer
+                                                        photoName={currentPhotoName}
+                                                        directory={currentDirectory}
+                                                        isSelected={isSelected}
+                                                        isSaved={isSaved}
+                                                        isDeleted={isDeleted}
+                                                    />
+                                                </div>
+                                            ) : (
                                                 <PhotoViewer
                                                     photoName={currentPhotoName}
                                                     directory={currentDirectory}
@@ -906,33 +857,83 @@ function App() {
                                                     isSaved={isSaved}
                                                     isDeleted={isDeleted}
                                                 />
-                                            </div>
-                                        ) : (
-                                            <PhotoViewer
-                                                photoName={currentPhotoName}
-                                                directory={currentDirectory}
-                                                isSelected={isSelected}
-                                                isSaved={isSaved}
-                                                isDeleted={isDeleted}
-                                            />
-                                        )}
-                                    </div>
-                                ) : (
-                                    <div className="main-photo-area">
-                                        <div className="empty-filter-message">
-                                            <h2>
-                                                {carouselFilter === 'selected' ? 'No Selected Photos' :
-                                                    carouselFilter === 'deleted' ? 'No Photos Marked for Deletion' :
-                                                        'No Photos'}
-                                            </h2>
-                                            <p>
-                                                {carouselFilter === 'selected' ? 'Switch to "All Images" or select some photos to view them here.' :
-                                                    carouselFilter === 'deleted' ? 'Switch to "All Images" or mark some photos for deletion to view them here.' :
-                                                        'No photos available.'}
-                                            </p>
+                                            )}
                                         </div>
-                                    </div>
-                                )}
+                                    ) : (
+                                        <div className="main-photo-area">
+                                            <div className="empty-filter-message">
+                                                <h2>
+                                                    {carouselFilter === 'selected' ? 'No Selected Photos' :
+                                                        carouselFilter === 'deleted' ? 'No Photos Marked for Deletion' :
+                                                            'No Photos'}
+                                                </h2>
+                                                <p>
+                                                    {carouselFilter === 'selected' ? 'Switch to "All Images" or select some photos to view them here.' :
+                                                        carouselFilter === 'deleted' ? 'Switch to "All Images" or mark some photos for deletion to view them here.' :
+                                                            'No photos available.'}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    )}
+                                    {currentPhotoName && !pinnedPhoto && (
+                                        <div className="exif-panel">
+                                            <div className="exif-panel-header">
+                                                <span className="info-position">{currentIndex + 1} / {filteredPhotos.length}</span>
+                                                <span className={`exif-status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : 'status-unselected'))}`}>
+                                                    {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                                                </span>
+                                            </div>
+                                            {photoInfo ? (
+                                                <div className="exif-rows">
+                                                    {photoInfo.date_taken && (() => {
+                                                        const fmt = formatExifDate(photoInfo.date_taken);
+                                                        return fmt ? (
+                                                            <div className="exif-row">
+                                                                <span className="exif-icon">📅</span>
+                                                                <div className="exif-content">
+                                                                    <div className="exif-primary">{fmt.date}</div>
+                                                                    <div className="exif-secondary">{fmt.time}</div>
+                                                                </div>
+                                                            </div>
+                                                        ) : null;
+                                                    })()}
+                                                    {photoInfo.camera_model && (
+                                                        <div className="exif-row">
+                                                            <span className="exif-icon">📷</span>
+                                                            <div className="exif-content">
+                                                                <div className="exif-primary">{photoInfo.camera_model}</div>
+                                                                <div className="exif-secondary">
+                                                                    {[
+                                                                        photoInfo.f_number,
+                                                                        photoInfo.shutter_speed,
+                                                                        photoInfo.focal_length,
+                                                                        photoInfo.iso ? `ISO${photoInfo.iso}` : null,
+                                                                    ].filter(Boolean).join('  ')}
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    <div className="exif-row">
+                                                        <span className="exif-icon">🖼️</span>
+                                                        <div className="exif-content">
+                                                            <div className="exif-primary">{photoInfo.filename}</div>
+                                                            <div className="exif-secondary">
+                                                                {[
+                                                                    photoInfo.megapixels,
+                                                                    (photoInfo.width && photoInfo.height)
+                                                                        ? `${photoInfo.width} × ${photoInfo.height}`
+                                                                        : null,
+                                                                ].filter(Boolean).join('  ')}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="exif-loading">Loading…</div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
                                 <div className="carousel-wrapper">
                                     <div className="carousel-filter-container">
                                         <select
@@ -958,11 +959,6 @@ function App() {
                                     ) : (
                                         <div className="carousel-container">
                                             <p className="carousel-empty-message">No photos to display</p>
-                                        </div>
-                                    )}
-                                    {currentPhotoName && (
-                                        <div className="carousel-filename-container">
-                                            <span className="carousel-filename">{currentPhotoName}</span>
                                         </div>
                                     )}
                                 </div>
