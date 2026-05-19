@@ -669,7 +669,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 		SkipDuplicates  bool   `json:"skip_duplicates"`
 		TargetDirectory string `json:"target_directory"`
 		ImportVideos    bool   `json:"import_videos"`
-		Recursive       bool   `json:"recursive"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
@@ -716,28 +715,15 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Scan directory for files
 	var allFiles []os.FileInfo
-	if data.Recursive {
-		filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
-				allFiles = append(allFiles, info)
-			}
-			return nil
-		})
-	} else {
-		files, err := ioutil.ReadDir(data.SourceDirectory)
+	filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			http.Error(w, "Failed to read source directory", http.StatusInternalServerError)
-			return
+			return nil
 		}
-		for _, file := range files {
-			if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
-				allFiles = append(allFiles, file)
-			}
+		if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
+			allFiles = append(allFiles, info)
 		}
-	}
+		return nil
+	})
 
 	// Build imported files set if skip duplicates enabled
 	var importedFiles map[string]bool
@@ -833,7 +819,6 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		SkipDuplicates  bool   `json:"skip_duplicates"`
 		TargetDirectory string `json:"target_directory"`
 		ImportVideos    bool   `json:"import_videos"`
-		Recursive       bool   `json:"recursive"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
@@ -911,31 +896,15 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		path string
 	}
 	var allFiles []fileWithPath
-	if data.Recursive {
-		filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
-				allFiles = append(allFiles, fileWithPath{info: info, path: path})
-			}
-			return nil
-		})
-	} else {
-		files, err := ioutil.ReadDir(data.SourceDirectory)
+	filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			http.Error(w, "Failed to read source directory", http.StatusInternalServerError)
-			return
+			return nil
 		}
-		for _, file := range files {
-			if !file.IsDir() && !strings.HasPrefix(file.Name(), "._") {
-				allFiles = append(allFiles, fileWithPath{
-					info: file,
-					path: filepath.Join(data.SourceDirectory, file.Name()),
-				})
-			}
+		if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
+			allFiles = append(allFiles, fileWithPath{info: info, path: path})
 		}
-	}
+		return nil
+	})
 
 	// Build imported files set if skip duplicates enabled
 	var importedFiles map[string]bool

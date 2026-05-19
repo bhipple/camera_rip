@@ -33,7 +33,6 @@ function App() {
     const [isLoadingPreview, setIsLoadingPreview] = useState(false);
     const [sourceDirectory, setSourceDirectory] = useState('');
     const [destinationBase, setDestinationBase] = useState('');
-    const [recursiveScan, setRecursiveScan] = useState(false);
     const [recentSourcePaths, setRecentSourcePaths] = useState([]);
     const [recentDestPaths, setRecentDestPaths] = useState([]);
     const [isFullScreen, setIsFullScreen] = useState(false);
@@ -81,7 +80,6 @@ function App() {
                     skip_duplicates: skipDuplicates,
                     target_directory: addToCurrentBatch ? currentDirectory : '',
                     import_videos: importVideos,
-                    recursive: recursiveScan,
                 }),
             });
             const data = await response.json();
@@ -94,7 +92,7 @@ function App() {
             setImportPreview(null);
         }
         setIsLoadingPreview(false);
-    }, [sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase, recursiveScan]);
+    }, [sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase]);
 
     useEffect(() => {
         fetchImportPreview();
@@ -112,7 +110,6 @@ function App() {
                 skip_duplicates: skipDuplicates,
                 target_directory: addToCurrentBatch ? currentDirectory : '',
                 import_videos: importVideos,
-                recursive: recursiveScan,
             };
 
             const response = await fetch(`${API_URL}/api/import-from-folder`, {
@@ -618,16 +615,6 @@ function App() {
                                     <option key={idx} value={path} />
                                 ))}
                             </datalist>
-                        </div>
-                        <div className="checkbox-container">
-                            <label>
-                                <input
-                                    type="checkbox"
-                                    checked={recursiveScan}
-                                    onChange={e => setRecursiveScan(e.target.checked)}
-                                />
-                                <span>Scan subdirectories</span>
-                            </label>
                         </div>
                     </div>
 
