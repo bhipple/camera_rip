@@ -14,7 +14,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -957,57 +956,29 @@ func extractRawPreview(directory, filename string) (string, error) {
 	previewDir := filepath.Join(rawPreviewCacheDir, directoryCacheKey(directory))
 	previewPath := filepath.Join(previewDir, filename+".jpg")
 
-	// Return cached preview if it exists
 	if _, err := os.Stat(previewPath); err == nil {
 		return previewPath, nil
 	}
 
-	// Create preview cache directory
 	if err := os.MkdirAll(previewDir, 0755); err != nil {
 		return "", err
 	}
 
 	rawFilePath := filepath.Join(resolvePhotoDir(directory), filename)
 
-	// Try multiple extraction methods in order of preference
-	extractionMethods := [][]string{
-		{"-b", "-PreviewImage", rawFilePath},
-		{"-b", "-JpgFromRaw", rawFilePath},
-		{"-b", "-OtherImage", rawFilePath},
-		{"-b", "-ThumbnailImage", rawFilePath},
-	}
-
-	var output []byte
-	var err error
-	var lastError error
-
-	for _, args := range extractionMethods {
-		cmd := exec.Command("exiftool", args...)
-		output, err = cmd.CombinedOutput()
-		if err == nil && len(output) > 0 {
-			// Check if output looks like JPEG (starts with FFD8)
-			if len(output) > 2 && output[0] == 0xFF && output[1] == 0xD8 {
-				break
-			}
-		}
-		lastError = err
-	}
-
-	if err != nil || len(output) == 0 {
-		if lastError != nil {
-			log.Printf("Failed to extract preview from %s: %v (output: %s)", filename, lastError, string(output))
-		} else {
-			log.Printf("Failed to extract preview from %s: no valid JPEG data found", filename)
-		}
-		return "", lastError
-	}
-
-	// Write preview to cache
-	if err := ioutil.WriteFile(previewPath, output, 0644); err != nil {
+	// extractEmbeddedJPEG selects the largest JPEG embedded in the RAW file,
+	// giving the best available preview quality.
+	jpegData, err := extractEmbeddedJPEG(rawFilePath)
+	if err != nil {
+		log.Printf("Failed to extract preview from %s: %v", filename, err)
 		return "", err
 	}
 
-	log.Printf("Extracted preview for raw file: %s (%d bytes)", filename, len(output))
+	if err := ioutil.WriteFile(previewPath, jpegData, 0644); err != nil {
+		return "", err
+	}
+
+	log.Printf("Extracted preview for raw file: %s (%d bytes)", filename, len(jpegData))
 	return previewPath, nil
 }
 

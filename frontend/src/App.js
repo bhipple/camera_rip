@@ -551,29 +551,78 @@ function App() {
                             isDeleted={isDeleted}
                         />
                     </div>
-                    <div className="fullscreen-info">
-                        <div className="fullscreen-filename">{currentPhotoName}</div>
-                        <div className="fullscreen-position">{currentIndex + 1} / {filteredPhotos.length}</div>
-                        <div className={`status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
-                            {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                    <div className="exif-panel">
+                        <div className="exif-panel-header">
+                            <span className="info-position">{currentIndex + 1} / {filteredPhotos.length}</span>
+                            <span className={`exif-status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : 'status-unselected'))}`}>
+                                {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                            </span>
                         </div>
-                    </div>
-                    <div className="fullscreen-controls">
-                        <button onClick={() => navigate(-1)}>← (j)</button>
-                        <button
-                            onClick={() => handleSelection(currentPhotoName, !isSelected)}
-                            disabled={isSaved || isDeleted}
-                            className={`select-toggle-button ${isSaved ? 'saved' : (isSelected ? 'selected' : '')}`}>
-                            {isSaved ? 'SAVED' : (isSelected ? 'Unselect (x)' : 'Select (s)')}
-                        </button>
-                        <button
-                            onClick={() => handleDeletion(currentPhotoName, !isDeleted)}
-                            disabled={isSaved}
-                            className={`delete-toggle-button ${isDeleted ? 'deleted' : ''}`}>
-                            {isDeleted ? 'Unmark Delete (d)' : 'Mark Delete (d)'}
-                        </button>
-                        <button onClick={() => navigate(1)}>→ (k)</button>
-                        <button onClick={() => setIsFullscreen(false)} className="fullscreen-exit">Exit Fullscreen (f / Esc)</button>
+                        {photoInfo ? (
+                            <div className="exif-rows">
+                                {photoInfo.date_taken && (() => {
+                                    const fmt = formatExifDate(photoInfo.date_taken);
+                                    return fmt ? (
+                                        <div className="exif-row">
+                                            <span className="exif-icon">📅</span>
+                                            <div className="exif-content">
+                                                <div className="exif-primary">{fmt.date}</div>
+                                                <div className="exif-secondary">{fmt.time}</div>
+                                            </div>
+                                        </div>
+                                    ) : null;
+                                })()}
+                                {photoInfo.camera_model && (
+                                    <div className="exif-row">
+                                        <span className="exif-icon">📷</span>
+                                        <div className="exif-content">
+                                            <div className="exif-primary">{photoInfo.camera_model}</div>
+                                            <div className="exif-secondary">
+                                                {[
+                                                    photoInfo.f_number,
+                                                    photoInfo.shutter_speed,
+                                                    photoInfo.focal_length,
+                                                    photoInfo.iso ? `ISO${photoInfo.iso}` : null,
+                                                ].filter(Boolean).join('  ')}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                <div className="exif-row">
+                                    <span className="exif-icon">🖼️</span>
+                                    <div className="exif-content">
+                                        <div className="exif-primary">{photoInfo.filename}</div>
+                                        <div className="exif-secondary">
+                                            {[
+                                                photoInfo.megapixels,
+                                                (photoInfo.width && photoInfo.height)
+                                                    ? `${photoInfo.width} × ${photoInfo.height}`
+                                                    : null,
+                                            ].filter(Boolean).join('  ')}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="exif-loading">Loading…</div>
+                        )}
+                        <div className="fullscreen-controls">
+                            <button onClick={() => navigate(-1)}>← (j)</button>
+                            <button
+                                onClick={() => handleSelection(currentPhotoName, !isSelected)}
+                                disabled={isSaved || isDeleted}
+                                className={`select-toggle-button ${isSaved ? 'saved' : (isSelected ? 'selected' : '')}`}>
+                                {isSaved ? 'SAVED' : (isSelected ? 'Unselect (x)' : 'Select (s)')}
+                            </button>
+                            <button
+                                onClick={() => handleDeletion(currentPhotoName, !isDeleted)}
+                                disabled={isSaved}
+                                className={`delete-toggle-button ${isDeleted ? 'deleted' : ''}`}>
+                                {isDeleted ? 'Unmark Delete (d)' : 'Mark Delete (d)'}
+                            </button>
+                            <button onClick={() => navigate(1)}>→ (k)</button>
+                            <button onClick={() => setIsFullscreen(false)} className="fullscreen-exit">Exit (Esc)</button>
+                        </div>
                     </div>
                 </div>
             )}
@@ -1004,20 +1053,71 @@ function App() {
             {/* Full Screen Mode */}
             {isFullScreen && currentPhotoName && (
                 <div className="fullscreen-overlay">
-                    <PhotoViewer
-                        photoName={currentPhotoName}
-                        directory={currentDirectory}
-                        isSelected={isSelected}
-                        isSaved={isSaved}
-                        isDeleted={isDeleted}
-                    />
-                    <div className="fullscreen-info">
-                        <div className="fullscreen-filename">{currentPhotoName}</div>
-                        <div className="fullscreen-position">{currentIndex + 1} / {filteredPhotos.length}</div>
-                        <div className={`fullscreen-status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
-                            {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                    <div className="fullscreen-photo">
+                        <PhotoViewer
+                            photoName={currentPhotoName}
+                            directory={currentDirectory}
+                            isSelected={isSelected}
+                            isSaved={isSaved}
+                            isDeleted={isDeleted}
+                        />
+                    </div>
+                    <div className="exif-panel">
+                        <div className="exif-panel-header">
+                            <span className="info-position">{currentIndex + 1} / {filteredPhotos.length}</span>
+                            <span className={`exif-status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : 'status-unselected'))}`}>
+                                {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                            </span>
                         </div>
-                        <div className="fullscreen-hint">C to copy • Double-click or ↑/↓ to zoom • F or ESC to exit</div>
+                        {photoInfo ? (
+                            <div className="exif-rows">
+                                {photoInfo.date_taken && (() => {
+                                    const fmt = formatExifDate(photoInfo.date_taken);
+                                    return fmt ? (
+                                        <div className="exif-row">
+                                            <span className="exif-icon">📅</span>
+                                            <div className="exif-content">
+                                                <div className="exif-primary">{fmt.date}</div>
+                                                <div className="exif-secondary">{fmt.time}</div>
+                                            </div>
+                                        </div>
+                                    ) : null;
+                                })()}
+                                {photoInfo.camera_model && (
+                                    <div className="exif-row">
+                                        <span className="exif-icon">📷</span>
+                                        <div className="exif-content">
+                                            <div className="exif-primary">{photoInfo.camera_model}</div>
+                                            <div className="exif-secondary">
+                                                {[
+                                                    photoInfo.f_number,
+                                                    photoInfo.shutter_speed,
+                                                    photoInfo.focal_length,
+                                                    photoInfo.iso ? `ISO${photoInfo.iso}` : null,
+                                                ].filter(Boolean).join('  ')}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                <div className="exif-row">
+                                    <span className="exif-icon">🖼️</span>
+                                    <div className="exif-content">
+                                        <div className="exif-primary">{photoInfo.filename}</div>
+                                        <div className="exif-secondary">
+                                            {[
+                                                photoInfo.megapixels,
+                                                (photoInfo.width && photoInfo.height)
+                                                    ? `${photoInfo.width} × ${photoInfo.height}`
+                                                    : null,
+                                            ].filter(Boolean).join('  ')}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="exif-loading">Loading…</div>
+                        )}
+                        <div className="fullscreen-hint">C to copy • ↑/↓ to zoom • F or ESC to exit</div>
                     </div>
                 </div>
             )}

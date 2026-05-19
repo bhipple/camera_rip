@@ -72,16 +72,6 @@ in pkgs.buildGoModule {
 
   modRoot = "./backend-go";
 
-  # Runtime dependencies
-  buildInputs = [ pkgs.exiftool ];
-
-  # Make exiftool available at runtime
-  postInstall = ''
-    wrapProgram $out/bin/backend --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.exiftool ]}
-  '';
-
-  nativeBuildInputs = [ pkgs.makeWrapper ];
-
   preBuild = ''
     mkdir -p frontend
     cp -r ${frontend}/build frontend/build
