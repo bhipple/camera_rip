@@ -7,6 +7,24 @@ import ConfirmModal from './ConfirmModal';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
 
+function formatExifDate(dateStr) {
+    if (!dateStr) return null;
+    const parts = dateStr.split(' ');
+    if (parts.length < 2) return null;
+    const [yr, mo, dy] = parts[0].split(':').map(Number);
+    if (!yr || !mo || !dy) return null;
+    const dt = new Date(yr, mo - 1, dy);
+    const dayName = dt.toLocaleDateString('en-US', { weekday: 'short' });
+    const monthName = dt.toLocaleDateString('en-US', { month: 'short' });
+    const [h, m] = (parts[1] || '00:00').split(':').map(Number);
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 || 12;
+    return {
+        date: `${monthName} ${dy}`,
+        time: `${dayName}, ${h12}:${String(m).padStart(2, '0')} ${ampm}`,
+    };
+}
+
 function App() {
     const [directories, setDirectories] = useState([]);
     const [currentDirectory, setCurrentDirectory] = useState('');
@@ -36,6 +54,7 @@ function App() {
     const [recentSourcePaths, setRecentSourcePaths] = useState([]);
     const [recentDestPaths, setRecentDestPaths] = useState([]);
     const [isFullScreen, setIsFullScreen] = useState(false);
+    const [photoInfo, setPhotoInfo] = useState(null);
 
     const fetchDirectories = useCallback(() => {
         fetch(`${API_URL}/api/directories`)
@@ -511,6 +530,19 @@ function App() {
     const isPinnedSaved = pinnedPhoto ? savedPhotos.has(pinnedPhoto) : false;
     const isPinnedDeleted = pinnedPhoto ? deletedPhotos.has(pinnedPhoto) : false;
 
+    useEffect(() => {
+        if (!currentPhotoName || !currentDirectory) {
+            setPhotoInfo(null);
+            return;
+        }
+        let cancelled = false;
+        fetch(`${API_URL}/api/photo-info?dir=${encodeURIComponent(currentDirectory)}&filename=${encodeURIComponent(currentPhotoName)}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => { if (!cancelled) setPhotoInfo(data); })
+            .catch(() => { if (!cancelled) setPhotoInfo(null); });
+        return () => { cancelled = true; };
+    }, [currentPhotoName, currentDirectory]);
+
     return (
         <div className={`App ${isFullscreen ? 'fullscreen-mode' : ''}`}>
             <ToastContainer position="bottom-center" autoClose={5000} hideProgressBar={false} newestOnTop={false} closeOnClick rtl={false} pauseOnFocusLoss draggable pauseOnHover theme="dark" />
@@ -573,10 +605,58 @@ function App() {
                 <div className="sidebar-controls">
                     {filteredPhotos.length > 0 && currentPhotoName && (
                         <div className="photo-info-sidebar">
-                            <p>{currentIndex + 1} / {filteredPhotos.length}</p>
-                            <p className={`status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
-                                {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
-                            </p>
+                            <div className="info-header">
+                                <span className="info-position">{currentIndex + 1} / {filteredPhotos.length}</span>
+                                <span className={`status ${isSaved ? 'status-saved' : (isSelected ? 'status-selected' : (isDeleted ? 'status-deleted' : ''))}`}>
+                                    {isSaved ? 'SAVED' : (isSelected ? 'SELECTED' : (isDeleted ? 'MARKED FOR DELETION' : 'Not Selected'))}
+                                </span>
+                            </div>
+                            {photoInfo && (
+                                <div className="exif-rows">
+                                    {photoInfo.date_taken && (() => {
+                                        const fmt = formatExifDate(photoInfo.date_taken);
+                                        return fmt ? (
+                                            <div className="exif-row">
+                                                <span className="exif-icon">📅</span>
+                                                <div className="exif-content">
+                                                    <div className="exif-primary">{fmt.date}</div>
+                                                    <div className="exif-secondary">{fmt.time}</div>
+                                                </div>
+                                            </div>
+                                        ) : null;
+                                    })()}
+                                    {photoInfo.camera_model && (
+                                        <div className="exif-row">
+                                            <span className="exif-icon">📷</span>
+                                            <div className="exif-content">
+                                                <div className="exif-primary">{photoInfo.camera_model}</div>
+                                                <div className="exif-secondary">
+                                                    {[
+                                                        photoInfo.f_number,
+                                                        photoInfo.shutter_speed,
+                                                        photoInfo.focal_length,
+                                                        photoInfo.iso ? `ISO${photoInfo.iso}` : null,
+                                                    ].filter(Boolean).join('  ')}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div className="exif-row">
+                                        <span className="exif-icon">🖼️</span>
+                                        <div className="exif-content">
+                                            <div className="exif-primary">{photoInfo.filename}</div>
+                                            <div className="exif-secondary">
+                                                {[
+                                                    photoInfo.megapixels,
+                                                    (photoInfo.width && photoInfo.height)
+                                                        ? `${photoInfo.width} × ${photoInfo.height}`
+                                                        : null,
+                                                ].filter(Boolean).join('  ')}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
 

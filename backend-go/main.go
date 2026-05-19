@@ -195,6 +195,7 @@ func main() {
 	http.HandleFunc("/api/recent-paths", corsHandler(recentPathsHandler))
 	http.HandleFunc("/api/selected-photos", corsHandler(getSelectedPhotosHandler))
 	http.HandleFunc("/api/delete-photos", corsHandler(deletePhotosHandler))
+	http.HandleFunc("/api/photo-info", corsHandler(photoInfoHandler))
 	http.HandleFunc("/photos/", corsHandler(servePhotoHandler))
 	http.HandleFunc("/thumbnail/", corsHandler(serveThumbnailHandler))
 
