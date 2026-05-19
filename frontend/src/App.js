@@ -41,7 +41,6 @@ function App() {
     });
     const [untilDate, setUntilDate] = useState('');
     const [skipDuplicates, setSkipDuplicates] = useState(true);
-    const [addToCurrentBatch, setAddToCurrentBatch] = useState(false);
     const [importVideos, setImportVideos] = useState(false);
     const [pinnedPhoto, setPinnedPhoto] = useState(null);
     const [showDeletePhotosModal, setShowDeletePhotosModal] = useState(false);
@@ -101,7 +100,6 @@ function App() {
                     since: sinceDate,
                     until: untilDate,
                     skip_duplicates: skipDuplicates,
-                    target_directory: addToCurrentBatch ? currentDirectory : '',
                     import_videos: importVideos,
                 }),
             });
@@ -115,7 +113,7 @@ function App() {
             setImportPreview(null);
         }
         setIsLoadingPreview(false);
-    }, [sinceDate, untilDate, skipDuplicates, addToCurrentBatch, currentDirectory, importVideos, sourceDirectory, destinationBase]);
+    }, [sinceDate, untilDate, skipDuplicates, importVideos, sourceDirectory, destinationBase]);
 
     useEffect(() => {
         fetchImportPreview();
@@ -123,45 +121,32 @@ function App() {
 
     const handleImport = async () => {
         setIsImporting(true);
-        const toastId = toast.loading("Importing from folder...");
+        const toastId = toast.loading("Loading photos...");
         try {
-            const body = {
-                source_directory: sourceDirectory,
-                destination_base: destinationBase,
-                since: sinceDate,
-                until: untilDate,
-                skip_duplicates: skipDuplicates,
-                target_directory: addToCurrentBatch ? currentDirectory : '',
-                import_videos: importVideos,
-            };
-
             const response = await fetch(`${API_URL}/api/import-from-folder`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(body)
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source_directory: sourceDirectory,
+                    since: sinceDate,
+                    until: untilDate,
+                    import_videos: importVideos,
+                }),
             });
             const responseText = await response.text();
             let data;
-            try {
-                data = JSON.parse(responseText);
-            } catch (e) {
-                data = { error: responseText || 'Unknown server error' };
-            }
+            try { data = JSON.parse(responseText); }
+            catch (e) { data = { error: responseText || 'Unknown server error' }; }
             if (response.ok) {
                 toast.update(toastId, { render: data.message, type: "success", isLoading: false, autoClose: 5000 });
-                if (data.new_directory && !addToCurrentBatch) {
-                    fetchDirectories();
+                if (data.new_directory) {
                     setCurrentDirectory(data.new_directory);
-                } else if (addToCurrentBatch) {
-                    window.location.reload();
                 }
             } else {
                 toast.update(toastId, { render: data.error || 'An unknown error occurred.', type: "error", isLoading: false, autoClose: 5000 });
             }
         } catch (err) {
-            toast.update(toastId, { render: "Failed to connect to the server for import.", type: "error", isLoading: false, autoClose: 5000 });
+            toast.update(toastId, { render: "Failed to connect to the server.", type: "error", isLoading: false, autoClose: 5000 });
         }
         setIsImporting(false);
     };
@@ -169,7 +154,10 @@ function App() {
     useEffect(() => {
         if (!currentDirectory) return;
         setPinnedPhoto(null); // Reset pinned photo when directory changes
-        fetch(`${API_URL}/api/photos?directory=${encodeURIComponent(currentDirectory)}`)
+        const photoParams = new URLSearchParams({ directory: currentDirectory });
+        if (sinceDate) photoParams.set('since', sinceDate);
+        if (untilDate) photoParams.set('until', untilDate);
+        fetch(`${API_URL}/api/photos?${photoParams}`)
             .then(res => res.json())
             .then(data => {
                 if (data.error) {
@@ -200,7 +188,7 @@ function App() {
                 setDeletedPhotos(new Set());
             });
 
-    }, [currentDirectory]);
+    }, [currentDirectory, sinceDate, untilDate]);
 
     const handleSelection = useCallback((photoName, select) => {
         if (savedPhotos.has(photoName)) {
@@ -245,16 +233,15 @@ function App() {
     }, [savedPhotos]);
 
     const handleSave = () => {
-        const toastId = toast.loading("Saving...")
+        const toastId = toast.loading("Saving...");
         const allFilesToSave = Array.from(new Set([...selectedPhotos, ...savedPhotos]));
 
         fetch(`${API_URL}/api/save`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                directory: currentDirectory,
+                source_directory: currentDirectory,
+                destination_base: destinationBase,
                 selected_files: allFilesToSave,
             }),
         })
@@ -264,9 +251,12 @@ function App() {
                     toast.update(toastId, { render: data.error, type: "error", isLoading: false, autoClose: 5000 });
                 } else {
                     toast.update(toastId, { render: data.message, type: "success", isLoading: false, autoClose: 5000 });
-                    // Move selected to saved and clear selected
                     setSavedPhotos(new Set(allFilesToSave));
                     setSelectedPhotos(new Set());
+                    if (data.new_directory) {
+                        fetchDirectories();
+                        setCurrentDirectory(data.new_directory);
+                    }
                 }
             })
             .catch(err => {
@@ -686,17 +676,6 @@ function App() {
                         <label>
                             <input
                                 type="checkbox"
-                                checked={addToCurrentBatch}
-                                onChange={e => setAddToCurrentBatch(e.target.checked)}
-                                disabled={!currentDirectory}
-                            />
-                            <span>Add to current batch</span>
-                        </label>
-                    </div>
-                    <div className="checkbox-container">
-                        <label>
-                            <input
-                                type="checkbox"
                                 checked={importVideos}
                                 onChange={e => setImportVideos(e.target.checked)}
                             />
@@ -760,12 +739,15 @@ function App() {
                 </div>
 
                 <div className="sidebar-controls">
-                    {directories.length > 0 && (
+                    {(directories.length > 0 || currentDirectory) && (
                         <select
                             value={currentDirectory}
                             onChange={e => setCurrentDirectory(e.target.value)}
                             className="directory-selector"
                         >
+                            {currentDirectory && !directories.includes(currentDirectory) && (
+                                <option value={currentDirectory}>{currentDirectory}</option>
+                            )}
                             {directories.map(dir => (
                                 <option key={dir} value={dir}>{dir}</option>
                             ))}

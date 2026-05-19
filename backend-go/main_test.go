@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsRawFile(t *testing.T) {
@@ -166,16 +167,9 @@ func createTestJPEG(t *testing.T, path string) {
 	}
 }
 
-// folderImportBody builds the JSON body for /api/import-from-folder.
-func folderImportBody(sourceDir, destBase string) string {
-	return `{"source_directory":"` + sourceDir + `","destination_base":"` + destBase + `","skip_duplicates":false}`
-}
-
-// TestFolderImportCustomDestination is the primary integration test for the bug fix:
-// importing to a directory outside photoBaseDir must return an absolute new_directory
-// and all subsequent API calls (getPhotos, servePhoto, serveThumbnail) must use the
-// correct path.
-func TestFolderImportCustomDestination(t *testing.T) {
+// TestFolderImportBrowsesSource verifies that import does not copy any files.
+// new_directory is the source itself, and all API calls work against it directly.
+func TestFolderImportBrowsesSource(t *testing.T) {
 	tmp := setupTestDirs(t)
 
 	sourceDir := filepath.Join(tmp, "source")
@@ -183,118 +177,10 @@ func TestFolderImportCustomDestination(t *testing.T) {
 	if err := os.MkdirAll(sourceDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-
-	// Put two test JPEGs in the source directory.
 	createTestJPEG(t, filepath.Join(sourceDir, "IMG_001.JPG"))
 	createTestJPEG(t, filepath.Join(sourceDir, "IMG_002.JPG"))
 
-	// --- Step 1: import ---
-	req := httptest.NewRequest(http.MethodPost, "/api/import-from-folder",
-		strings.NewReader(folderImportBody(sourceDir, destBase)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	importFromFolderHandler(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("import returned %d: %s", w.Code, w.Body.String())
-	}
-
-	var importResult map[string]interface{}
-	if err := json.NewDecoder(w.Body).Decode(&importResult); err != nil {
-		t.Fatalf("import response not valid JSON: %v", err)
-	}
-
-	newDir, ok := importResult["new_directory"].(string)
-	if !ok || newDir == "" {
-		t.Fatalf("new_directory missing or empty in response: %v", importResult)
-	}
-
-	// new_directory must be an absolute path under destBase, not under photoBaseDir.
-	if !filepath.IsAbs(newDir) {
-		t.Errorf("new_directory should be absolute, got %q", newDir)
-	}
-	if !strings.HasPrefix(newDir, destBase) {
-		t.Errorf("new_directory %q should be under destBase %q", newDir, destBase)
-	}
-	if strings.HasPrefix(newDir, photoBaseDir) {
-		t.Errorf("new_directory %q must NOT be under photoBaseDir %q", newDir, photoBaseDir)
-	}
-
-	// Files must exist at the destination.
-	for _, name := range []string{"IMG_001.JPG", "IMG_002.JPG"} {
-		if _, err := os.Stat(filepath.Join(newDir, name)); os.IsNotExist(err) {
-			t.Errorf("expected copied file %q to exist in %q", name, newDir)
-		}
-	}
-
-	// --- Step 2: GET /api/photos?directory=<absolute path> ---
-	req2 := httptest.NewRequest(http.MethodGet, "/api/photos?directory="+newDir, nil)
-	w2 := httptest.NewRecorder()
-	getPhotosHandler(w2, req2)
-
-	if w2.Code != http.StatusOK {
-		t.Fatalf("getPhotos returned %d: %s", w2.Code, w2.Body.String())
-	}
-	var photos []string
-	if err := json.NewDecoder(w2.Body).Decode(&photos); err != nil {
-		t.Fatalf("getPhotos response not valid JSON: %v", err)
-	}
-	if len(photos) != 2 {
-		t.Errorf("expected 2 photos, got %d: %v", len(photos), photos)
-	}
-
-	// --- Step 3: GET /photos/<filename>?dir=<absolute path> ---
-	req3 := httptest.NewRequest(http.MethodGet, "/photos/IMG_001.JPG?dir="+newDir, nil)
-	req3.URL.RawQuery = "dir=" + newDir
-	w3 := httptest.NewRecorder()
-	servePhotoHandler(w3, req3)
-
-	if w3.Code != http.StatusOK {
-		t.Errorf("servePhoto returned %d: %s", w3.Code, w3.Body.String())
-	}
-	if ct := w3.Header().Get("Content-Type"); !strings.Contains(ct, "image/") {
-		t.Errorf("expected image Content-Type, got %q", ct)
-	}
-
-	// --- Step 4: GET /thumbnail/<filename>?dir=<absolute path> ---
-	req4 := httptest.NewRequest(http.MethodGet, "/thumbnail/IMG_001.JPG?dir="+newDir, nil)
-	req4.URL.RawQuery = "dir=" + newDir
-	w4 := httptest.NewRecorder()
-	serveThumbnailHandler(w4, req4)
-
-	if w4.Code != http.StatusOK {
-		t.Errorf("serveThumbnail returned %d: %s", w4.Code, w4.Body.String())
-	}
-
-	// Thumbnail must be cached under thumbnailCacheDir using directoryCacheKey, NOT
-	// under a path derived from photoBaseDir.
-	cacheKey := directoryCacheKey(newDir)
-	thumbPath := filepath.Join(thumbnailCacheDir, cacheKey, "IMG_001.JPG")
-	if _, err := os.Stat(thumbPath); os.IsNotExist(err) {
-		t.Errorf("thumbnail not cached at expected path %q", thumbPath)
-	}
-	// The old (wrong) path under photoBaseDir must not exist.
-	wrongThumbPath := filepath.Join(thumbnailCacheDir, filepath.Base(newDir), "IMG_001.JPG")
-	if cacheKey != filepath.Base(newDir) {
-		if _, err := os.Stat(wrongThumbPath); err == nil {
-			t.Errorf("thumbnail was cached at wrong path %q (should be at %q)", wrongThumbPath, thumbPath)
-		}
-	}
-}
-
-// TestFolderImportDefaultDestination verifies that the standard case (no custom destBase)
-// is unchanged: new_directory is a basename inside photoBaseDir.
-func TestFolderImportDefaultDestination(t *testing.T) {
-	tmp := setupTestDirs(t)
-
-	sourceDir := filepath.Join(tmp, "source")
-	if err := os.MkdirAll(sourceDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	createTestJPEG(t, filepath.Join(sourceDir, "IMG_001.JPG"))
-
-	// destination_base is empty → defaults to photoBaseDir.
-	body := `{"source_directory":"` + sourceDir + `","destination_base":"","skip_duplicates":false}`
+	body := `{"source_directory":"` + sourceDir + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/import-from-folder", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -305,27 +191,27 @@ func TestFolderImportDefaultDestination(t *testing.T) {
 	}
 	var result map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
-		t.Fatal(err)
+		t.Fatalf("import response not valid JSON: %v", err)
 	}
 
-	newDir, _ := result["new_directory"].(string)
-	if newDir == "" {
-		t.Fatal("new_directory missing from response")
+	newDir, ok := result["new_directory"].(string)
+	if !ok || newDir == "" {
+		t.Fatalf("new_directory missing or empty: %v", result)
 	}
 
-	// In the default case new_directory is now the full absolute path under photoBaseDir.
-	if !filepath.IsAbs(newDir) {
-		t.Errorf("new_directory should be absolute, got %q", newDir)
+	// new_directory is the source itself — no files were copied.
+	if newDir != sourceDir {
+		t.Errorf("new_directory = %q, want source %q", newDir, sourceDir)
 	}
-	if !strings.HasPrefix(newDir, photoBaseDir) {
-		t.Errorf("new_directory %q should be under photoBaseDir %q", newDir, photoBaseDir)
+	// destBase must not have been created.
+	if _, err := os.Stat(destBase); err == nil {
+		t.Errorf("destBase %q was created during import but should not have been", destBase)
 	}
 
-	// getPhotos must work with this path.
+	// GET /api/photos works against the source.
 	req2 := httptest.NewRequest(http.MethodGet, "/api/photos?directory="+newDir, nil)
 	w2 := httptest.NewRecorder()
 	getPhotosHandler(w2, req2)
-
 	if w2.Code != http.StatusOK {
 		t.Fatalf("getPhotos returned %d: %s", w2.Code, w2.Body.String())
 	}
@@ -333,8 +219,105 @@ func TestFolderImportDefaultDestination(t *testing.T) {
 	if err := json.NewDecoder(w2.Body).Decode(&photos); err != nil {
 		t.Fatal(err)
 	}
-	if len(photos) != 1 {
-		t.Errorf("expected 1 photo, got %d", len(photos))
+	if len(photos) != 2 {
+		t.Errorf("expected 2 photos, got %d: %v", len(photos), photos)
+	}
+
+	// GET /photos/<filename> works against the source.
+	req3 := httptest.NewRequest(http.MethodGet, "/photos/IMG_001.JPG?dir="+newDir, nil)
+	req3.URL.RawQuery = "dir=" + newDir
+	w3 := httptest.NewRecorder()
+	servePhotoHandler(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Errorf("servePhoto returned %d: %s", w3.Code, w3.Body.String())
+	}
+	if ct := w3.Header().Get("Content-Type"); !strings.Contains(ct, "image/") {
+		t.Errorf("expected image Content-Type, got %q", ct)
+	}
+
+	// GET /thumbnail works against the source.
+	req4 := httptest.NewRequest(http.MethodGet, "/thumbnail/IMG_001.JPG?dir="+newDir, nil)
+	req4.URL.RawQuery = "dir=" + newDir
+	w4 := httptest.NewRecorder()
+	serveThumbnailHandler(w4, req4)
+	if w4.Code != http.StatusOK {
+		t.Errorf("serveThumbnail returned %d: %s", w4.Code, w4.Body.String())
+	}
+	cacheKey := directoryCacheKey(newDir)
+	thumbPath := filepath.Join(thumbnailCacheDir, cacheKey, "IMG_001.JPG")
+	if _, err := os.Stat(thumbPath); os.IsNotExist(err) {
+		t.Errorf("thumbnail not cached at expected path %q", thumbPath)
+	}
+}
+
+// TestSaveSelectedPhotos verifies that saving copies only the selected files from the
+// source to a new timestamped directory under destination_base.
+func TestSaveSelectedPhotos(t *testing.T) {
+	tmp := setupTestDirs(t)
+
+	sourceDir := filepath.Join(tmp, "source")
+	destBase := filepath.Join(tmp, "dest")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	createTestJPEG(t, filepath.Join(sourceDir, "IMG_001.JPG"))
+	createTestJPEG(t, filepath.Join(sourceDir, "IMG_002.JPG"))
+	createTestJPEG(t, filepath.Join(sourceDir, "IMG_003.JPG"))
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"source_directory": sourceDir,
+		"destination_base": destBase,
+		"selected_files":   []string{"IMG_001.JPG", "IMG_003.JPG"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/save", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	saveSelectedPhotosHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("save returned %d: %s", w.Code, w.Body.String())
+	}
+	var result map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("save response not valid JSON: %v", err)
+	}
+
+	newDir, ok := result["new_directory"].(string)
+	if !ok || newDir == "" {
+		t.Fatalf("new_directory missing from save response: %v", result)
+	}
+
+	// new_directory must be under destBase, not the source.
+	if !strings.HasPrefix(newDir, destBase) {
+		t.Errorf("new_directory %q should be under destBase %q", newDir, destBase)
+	}
+	if newDir == sourceDir {
+		t.Errorf("new_directory must not equal sourceDir")
+	}
+
+	// Only the two selected files are present; IMG_002.JPG must not be copied.
+	for _, name := range []string{"IMG_001.JPG", "IMG_003.JPG"} {
+		if _, err := os.Stat(filepath.Join(newDir, name)); os.IsNotExist(err) {
+			t.Errorf("expected selected file %q in destination", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(newDir, "IMG_002.JPG")); err == nil {
+		t.Errorf("IMG_002.JPG was copied but was not selected")
+	}
+
+	// getPhotos must work against the new destination.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/photos?directory="+newDir, nil)
+	w2 := httptest.NewRecorder()
+	getPhotosHandler(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("getPhotos returned %d: %s", w2.Code, w2.Body.String())
+	}
+	var photos []string
+	if err := json.NewDecoder(w2.Body).Decode(&photos); err != nil {
+		t.Fatal(err)
+	}
+	if len(photos) != 2 {
+		t.Errorf("expected 2 photos in destination, got %d: %v", len(photos), photos)
 	}
 }
 
@@ -379,5 +362,87 @@ func TestDirectoryCacheKey(t *testing.T) {
 	want := "home/user/syncthing/canon_filtered/2026-01-01_12-00-00"
 	if got := directoryCacheKey(outside); got != want {
 		t.Errorf("directoryCacheKey(outside): got %q, want %q", got, want)
+	}
+}
+
+// TestGetPhotosDateFilter verifies that the since/until query params filter the photo
+// list by file mtime. This is the mechanism that makes From/To date filtering work
+// when browsing a source directory directly (no copy-on-import).
+func TestGetPhotosDateFilter(t *testing.T) {
+	tmp := setupTestDirs(t)
+
+	sourceDir := filepath.Join(tmp, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create three photos and assign distinct mtimes.
+	paths := map[string]time.Time{
+		"old.JPG":    time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+		"middle.JPG": time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC),
+		"new.JPG":    time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+	}
+	for name, mtime := range paths {
+		p := filepath.Join(sourceDir, name)
+		createTestJPEG(t, p)
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatalf("Chtimes %s: %v", name, err)
+		}
+	}
+
+	call := func(since, until string) []string {
+		t.Helper()
+		q := "directory=" + sourceDir
+		if since != "" {
+			q += "&since=" + since
+		}
+		if until != "" {
+			q += "&until=" + until
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/photos?"+q, nil)
+		w := httptest.NewRecorder()
+		getPhotosHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("getPhotos returned %d: %s", w.Code, w.Body.String())
+		}
+		var photos []string
+		if err := json.NewDecoder(w.Body).Decode(&photos); err != nil {
+			t.Fatal(err)
+		}
+		return photos
+	}
+
+	// No filter → all three photos.
+	if got := call("", ""); len(got) != 3 {
+		t.Errorf("no filter: expected 3 photos, got %v", got)
+	}
+
+	// since=2026-01-01 → middle and new only.
+	got := call("2026-01-01", "")
+	if len(got) != 2 {
+		t.Errorf("since filter: expected 2 photos, got %v", got)
+	}
+	for _, name := range got {
+		if name == "old.JPG" {
+			t.Errorf("since filter: old.JPG should have been excluded")
+		}
+	}
+
+	// since=2026-01-01 until=2026-04-01 → middle only.
+	got = call("2026-01-01", "2026-04-01")
+	if len(got) != 1 || got[0] != "middle.JPG" {
+		t.Errorf("since+until filter: expected [middle.JPG], got %v", got)
+	}
+
+	// until=2025-01-01 → only old.JPG (the only file before 2025).
+	got = call("", "2025-01-01")
+	if len(got) != 1 || got[0] != "old.JPG" {
+		t.Errorf("until filter: expected [old.JPG], got %v", got)
+	}
+
+	// until=2020-01-01 → nothing (all files are after 2020).
+	got = call("", "2020-01-01")
+	if len(got) != 0 {
+		t.Errorf("until filter (excludes all): expected [], got %v", got)
 	}
 }

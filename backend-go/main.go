@@ -278,6 +278,16 @@ func getPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var sinceDate, untilDate time.Time
+	if s := r.URL.Query().Get("since"); s != "" {
+		sinceDate, _ = time.Parse("2006-01-02", s)
+	}
+	if u := r.URL.Query().Get("until"); u != "" {
+		if t, err := time.Parse("2006-01-02", u); err == nil {
+			untilDate = t.AddDate(0, 0, 1)
+		}
+	}
+
 	targetDir := resolvePhotoDir(directory)
 	files, err := ioutil.ReadDir(targetDir)
 	if err != nil {
@@ -292,6 +302,12 @@ func getPhotosHandler(w http.ResponseWriter, r *http.Request) {
 			isImg := strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".jpg") ||
 				strings.HasSuffix(lowerName, ".jpeg") || strings.HasSuffix(lowerName, ".gif")
 			if isImg || isRawFile(file.Name()) {
+				if !sinceDate.IsZero() && file.ModTime().Before(sinceDate) {
+					continue
+				}
+				if !untilDate.IsZero() && !file.ModTime().Before(untilDate) {
+					continue
+				}
 				photos = append(photos, file.Name())
 			}
 		}
@@ -352,8 +368,9 @@ func getSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 
 func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 	var data struct {
-		SelectedFiles []string `json:"selected_files"`
-		Directory     string   `json:"directory"`
+		SourceDirectory string   `json:"source_directory"`
+		DestinationBase string   `json:"destination_base"`
+		SelectedFiles   []string `json:"selected_files"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -361,46 +378,78 @@ func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(data.SelectedFiles) == 0 || data.Directory == "" {
-		http.Error(w, "Missing 'selected_files' or 'directory' in request", http.StatusBadRequest)
+	if len(data.SelectedFiles) == 0 {
+		http.Error(w, "No files selected", http.StatusBadRequest)
+		return
+	}
+	if data.SourceDirectory == "" {
+		http.Error(w, "Missing 'source_directory'", http.StatusBadRequest)
 		return
 	}
 
-	sourceDir := resolvePhotoDir(data.Directory)
-	destinationDir := filepath.Join(sourceDir, "selected")
+	sourceDir := resolvePhotoDir(data.SourceDirectory)
 
+	destBase := data.DestinationBase
+	if destBase == "" {
+		destBase = photoBaseDir
+	}
+	if strings.HasPrefix(destBase, "~/") {
+		userHomeDir, err := os.UserHomeDir()
+		if err != nil {
+			http.Error(w, "Failed to get user home directory", http.StatusInternalServerError)
+			return
+		}
+		destBase = filepath.Join(userHomeDir, destBase[2:])
+	}
+
+	destinationDir := filepath.Join(destBase, time.Now().Format("2006-01-02_15-04-05"))
 	if err := os.MkdirAll(destinationDir, 0755); err != nil {
 		http.Error(w, "Failed to create destination directory", http.StatusInternalServerError)
 		return
 	}
 
+	copiedCount := 0
+	var copiedFiles []string
 	for _, filename := range data.SelectedFiles {
 		sourcePath := filepath.Join(sourceDir, filename)
 		destinationPath := filepath.Join(destinationDir, filename)
 
-		sourceFile, err := os.Open(sourcePath)
+		src, err := os.Open(sourcePath)
 		if err != nil {
-			log.Printf("Failed to open source file: %v", err)
+			log.Printf("Failed to open source file %s: %v", filename, err)
 			continue
 		}
-		defer sourceFile.Close()
-
-		destinationFile, err := os.Create(destinationPath)
+		dst, err := os.Create(destinationPath)
 		if err != nil {
-			log.Printf("Failed to create destination file: %v", err)
+			src.Close()
+			log.Printf("Failed to create destination file %s: %v", filename, err)
 			continue
 		}
-		defer destinationFile.Close()
-
-		if _, err := io.Copy(destinationFile, sourceFile); err != nil {
-			log.Printf("Failed to copy file: %v", err)
+		_, copyErr := io.Copy(dst, src)
+		src.Close()
+		dst.Close()
+		if copyErr != nil {
+			log.Printf("Failed to copy file %s: %v", filename, copyErr)
 			continue
 		}
+		copiedCount++
+		copiedFiles = append(copiedFiles, filename)
 	}
 
+	saveRecentPath(data.SourceDirectory, "source")
+	if data.DestinationBase != "" {
+		saveRecentPath(data.DestinationBase, "destination")
+	}
+
+	go func() {
+		log.Printf("Starting background thumbnail generation for saved directory: %s (%d photos)", destinationDir, len(copiedFiles))
+		preGenerateThumbnails(destinationDir, copiedFiles)
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Successfully copied " + strconv.Itoa(len(data.SelectedFiles)) + " files to '" + destinationDir + "'",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":       "Saved " + strconv.Itoa(copiedCount) + " photos to " + filepath.Base(destinationDir) + ".",
+		"new_directory": destinationDir,
 	})
 }
 
@@ -811,14 +860,13 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// importFromFolderHandler records the source directory as the active browsing location.
+// No files are copied — photos are viewed directly from source until the user saves selections.
 func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 	var data struct {
 		SourceDirectory string `json:"source_directory"`
-		DestinationBase string `json:"destination_base"`
 		Since           string `json:"since"`
 		Until           string `json:"until"`
-		SkipDuplicates  bool   `json:"skip_duplicates"`
-		TargetDirectory string `json:"target_directory"`
 		ImportVideos    bool   `json:"import_videos"`
 	}
 
@@ -832,48 +880,13 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate source directory exists
 	if _, err := os.Stat(data.SourceDirectory); os.IsNotExist(err) {
 		http.Error(w, "Source directory does not exist", http.StatusNotFound)
 		return
 	}
 
-	// Determine destination directory
-	var destinationDir string
-	var isNewBatch bool
-	var destBase string
-
-	if data.DestinationBase != "" {
-		destBase = data.DestinationBase
-	} else {
-		destBase = photoBaseDir
-	}
-
-	// Expand tilde in destination base
-	if strings.HasPrefix(destBase, "~/") {
-		userHomeDir, err := os.UserHomeDir()
-		if err != nil {
-			http.Error(w, "Failed to get user home directory", http.StatusInternalServerError)
-			return
-		}
-		destBase = filepath.Join(userHomeDir, destBase[2:])
-	}
-
-	if data.TargetDirectory != "" {
-		destinationDir = filepath.Join(destBase, data.TargetDirectory)
-		isNewBatch = false
-		if _, err := os.Stat(destinationDir); os.IsNotExist(err) {
-			http.Error(w, "Target directory does not exist", http.StatusBadRequest)
-			return
-		}
-	} else {
-		destinationDir = filepath.Join(destBase, time.Now().Format("2006-01-02_15-04-05"))
-		isNewBatch = true
-	}
-
-	// Parse dates
-	var sinceDate time.Time
-	var untilDate time.Time
+	// Parse optional date filters
+	var sinceDate, untilDate time.Time
 	var err error
 	if data.Since != "" {
 		sinceDate, err = time.Parse("2006-01-02", data.Since)
@@ -891,155 +904,51 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		untilDate = untilDate.AddDate(0, 0, 1)
 	}
 
-	// Scan directory for files
-	type fileWithPath struct {
-		info os.FileInfo
-		path string
-	}
-	var allFiles []fileWithPath
+	// Collect matching files for thumbnail pre-generation
+	var matchedFiles []string
 	filepath.Walk(data.SourceDirectory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		if err != nil || info.IsDir() || strings.HasPrefix(info.Name(), "._") {
 			return nil
 		}
-		if !info.IsDir() && !strings.HasPrefix(info.Name(), "._") {
-			allFiles = append(allFiles, fileWithPath{info: info, path: path})
+		lowerName := strings.ToLower(info.Name())
+		isImage := strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg")
+		isRaw := strings.HasSuffix(lowerName, ".cr3") || strings.HasSuffix(lowerName, ".orf")
+		isMp4 := strings.HasSuffix(lowerName, ".mp4")
+
+		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
+			return nil
 		}
+		modTime := info.ModTime()
+		if !sinceDate.IsZero() && modTime.Before(sinceDate) {
+			return nil
+		}
+		if !untilDate.IsZero() && !modTime.Before(untilDate) {
+			return nil
+		}
+		matchedFiles = append(matchedFiles, info.Name())
 		return nil
 	})
 
-	// Build imported files set if skip duplicates enabled
-	var importedFiles map[string]bool
-	if data.SkipDuplicates {
-		importedFiles = buildImportedFilesSet()
-	}
-
-	destinationDirCreated := !isNewBatch
-	copiedCount := 0
-	skippedDuplicates := 0
-	var copiedFiles []string
-
-	for _, fileEntry := range allFiles {
-		file := fileEntry.info
-		lowerName := strings.ToLower(file.Name())
-		isImage := strings.HasSuffix(lowerName, ".jpg") || strings.HasSuffix(lowerName, ".jpeg") ||
-			strings.HasSuffix(lowerName, ".png") || strings.HasSuffix(lowerName, ".gif")
-		isMp4 := strings.HasSuffix(lowerName, ".mp4")
-		isRaw := strings.HasSuffix(lowerName, ".cr3") || strings.HasSuffix(lowerName, ".cr2") ||
-			strings.HasSuffix(lowerName, ".arw") || strings.HasSuffix(lowerName, ".nef") ||
-			strings.HasSuffix(lowerName, ".raf") || strings.HasSuffix(lowerName, ".dng")
-
-		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
-			continue
-		}
-
-		// Check date filter
-		modTime := file.ModTime()
-		if !sinceDate.IsZero() && modTime.Before(sinceDate) {
-			continue
-		}
-		if !untilDate.IsZero() && !modTime.Before(untilDate) {
-			continue
-		}
-
-		// Check duplicates
-		if data.SkipDuplicates && importedFiles[file.Name()] {
-			skippedDuplicates++
-			continue
-		}
-
-		destinationFile := filepath.Join(destinationDir, file.Name())
-		if _, err := os.Stat(destinationFile); err == nil {
-			continue
-		}
-
-		// Create destination directory on first file
-		if !destinationDirCreated {
-			if err := os.MkdirAll(destinationDir, 0755); err != nil {
-				http.Error(w, "Could not create destination directory", http.StatusInternalServerError)
-				return
-			}
-			destinationDirCreated = true
-		}
-
-		// Copy file
-		source, err := os.Open(fileEntry.path)
-		if err != nil {
-			log.Printf("Failed to open source file: %v", err)
-			continue
-		}
-		defer source.Close()
-
-		destination, err := os.Create(destinationFile)
-		if err != nil {
-			log.Printf("Failed to create destination file: %v", err)
-			continue
-		}
-		defer destination.Close()
-
-		if _, err := io.Copy(destination, source); err != nil {
-			log.Printf("Failed to copy file: %v", err)
-			continue
-		}
-
-		copiedCount++
-		// Add both images and raw files for thumbnail generation
-		if isImage || isRaw {
-			copiedFiles = append(copiedFiles, file.Name())
-		}
-	}
-
-	// Handle case where no files were copied
-	if copiedCount == 0 {
-		var message string
-		if !sinceDate.IsZero() || !untilDate.IsZero() {
-			message = "No new files found in the selected date range"
-		} else if skippedDuplicates > 0 {
-			message = "All " + strconv.Itoa(skippedDuplicates) + " files have already been imported."
-		} else {
-			message = "No files found to import."
-		}
-
+	if len(matchedFiles) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"message":       message,
+			"message":       "No matching photos found in source directory.",
 			"new_directory": nil,
 		})
 		return
 	}
 
-	// Save recent paths
 	saveRecentPath(data.SourceDirectory, "source")
-	if data.DestinationBase != "" {
-		saveRecentPath(data.DestinationBase, "destination")
-	}
 
-	// Start async thumbnail generation; use full destinationDir so resolvePhotoDir works correctly
-	dirName := filepath.Base(destinationDir)
 	go func() {
-		log.Printf("Starting background thumbnail generation for imported directory: %s (%d photos)", destinationDir, len(copiedFiles))
-		preGenerateThumbnails(destinationDir, copiedFiles)
+		log.Printf("Starting background thumbnail generation for source: %s (%d photos)", data.SourceDirectory, len(matchedFiles))
+		preGenerateThumbnails(data.SourceDirectory, matchedFiles)
 	}()
 
-	message := "Successfully copied " + strconv.Itoa(copiedCount) + " new files"
-	if !isNewBatch {
-		message += " to " + dirName
-	}
-	message += "."
-	if skippedDuplicates > 0 {
-		message += " Skipped " + strconv.Itoa(skippedDuplicates) + " already imported."
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	var newDirectory interface{}
-	if isNewBatch {
-		// Return full path so frontend can resolve photos from the correct location
-		newDirectory = destinationDir
-	} else {
-		newDirectory = nil
-	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":       message,
-		"new_directory": newDirectory,
+		"message":       fmt.Sprintf("Ready to browse %d photos.", len(matchedFiles)),
+		"new_directory": data.SourceDirectory,
 	})
 }
 
