@@ -668,8 +668,8 @@
 }
 
 .carousel-thumbnail.selected {
-  border-color: #98971a;
-  box-shadow: 0 0 10px #98971a;
+  border-color: #4a9eff;
+  box-shadow: 0 0 10px #4a9eff;
 }
 
 .carousel-thumbnail.deleted {
