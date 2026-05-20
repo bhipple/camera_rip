@@ -401,17 +401,29 @@ func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 		destBase = filepath.Join(userHomeDir, destBase[2:])
 	}
 
-	destinationDir := filepath.Join(destBase, time.Now().Format("2006-01-02_15-04-05"))
-	if err := os.MkdirAll(destinationDir, 0755); err != nil {
-		http.Error(w, "Failed to create destination directory", http.StatusInternalServerError)
-		return
+	dateDir := func(sourcePath string) string {
+		if exif := parsePhotoExif(sourcePath); exif != nil && exif.DateTaken != "" {
+			// DateTaken format: "2026:05:02 08:08:36"
+			datePart := strings.SplitN(exif.DateTaken, " ", 2)[0]
+			dateStr := strings.ReplaceAll(datePart, ":", "-")
+			if len(dateStr) == 10 {
+				return dateStr
+			}
+		}
+		return time.Now().Format("2006-01-02")
 	}
 
 	copiedCount := 0
-	var copiedFiles []string
+	copiedByDir := make(map[string][]string)
 	for _, filename := range data.SelectedFiles {
 		sourcePath := filepath.Join(sourceDir, filename)
-		destinationPath := filepath.Join(destinationDir, filename)
+		dateStr := dateDir(sourcePath)
+		destDir := filepath.Join(destBase, dateStr)
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			log.Printf("Failed to create destination directory %s: %v", destDir, err)
+			continue
+		}
+		destinationPath := filepath.Join(destDir, filename)
 
 		src, err := os.Open(sourcePath)
 		if err != nil {
@@ -432,7 +444,7 @@ func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		copiedCount++
-		copiedFiles = append(copiedFiles, filename)
+		copiedByDir[destDir] = append(copiedByDir[destDir], filename)
 	}
 
 	saveRecentPath(data.SourceDirectory, "source")
@@ -441,14 +453,17 @@ func saveSelectedPhotosHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		log.Printf("Starting background thumbnail generation for saved directory: %s (%d photos)", destinationDir, len(copiedFiles))
-		preGenerateThumbnails(destinationDir, copiedFiles)
+		for dir, files := range copiedByDir {
+			log.Printf("Starting background thumbnail generation for saved directory: %s (%d photos)", dir, len(files))
+			preGenerateThumbnails(dir, files)
+		}
 	}()
 
+	// Return the dest base so the frontend can navigate to it
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":       "Saved " + strconv.Itoa(copiedCount) + " photos to " + filepath.Base(destinationDir) + ".",
-		"new_directory": destinationDir,
+		"message":       "Saved " + strconv.Itoa(copiedCount) + " photos to " + filepath.Base(destBase) + ".",
+		"new_directory": destBase,
 	})
 }
 

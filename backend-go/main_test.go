@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -251,7 +252,8 @@ func TestFolderImportBrowsesSource(t *testing.T) {
 }
 
 // TestSaveSelectedPhotos verifies that saving copies only the selected files from the
-// source to a new timestamped directory under destination_base.
+// source into destBase/YYYY-MM-DD/ subdirectories keyed by EXIF date (falling back to
+// today's date when EXIF is absent).
 func TestSaveSelectedPhotos(t *testing.T) {
 	tmp := setupTestDirs(t)
 
@@ -287,26 +289,26 @@ func TestSaveSelectedPhotos(t *testing.T) {
 		t.Fatalf("new_directory missing from save response: %v", result)
 	}
 
-	// new_directory must be under destBase, not the source.
-	if !strings.HasPrefix(newDir, destBase) {
-		t.Errorf("new_directory %q should be under destBase %q", newDir, destBase)
+	// new_directory is now destBase itself; photos land in dated subdirs.
+	if newDir != destBase {
+		t.Errorf("new_directory = %q, want destBase %q", newDir, destBase)
 	}
-	if newDir == sourceDir {
-		t.Errorf("new_directory must not equal sourceDir")
-	}
+
+	// Test JPEGs have no EXIF, so the fallback date (today) is used.
+	dateSubdir := filepath.Join(destBase, time.Now().Format("2006-01-02"))
 
 	// Only the two selected files are present; IMG_002.JPG must not be copied.
 	for _, name := range []string{"IMG_001.JPG", "IMG_003.JPG"} {
-		if _, err := os.Stat(filepath.Join(newDir, name)); os.IsNotExist(err) {
-			t.Errorf("expected selected file %q in destination", name)
+		if _, err := os.Stat(filepath.Join(dateSubdir, name)); os.IsNotExist(err) {
+			t.Errorf("expected selected file %q in %q", name, dateSubdir)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(newDir, "IMG_002.JPG")); err == nil {
+	if _, err := os.Stat(filepath.Join(dateSubdir, "IMG_002.JPG")); err == nil {
 		t.Errorf("IMG_002.JPG was copied but was not selected")
 	}
 
-	// getPhotos must work against the new destination.
-	req2 := httptest.NewRequest(http.MethodGet, "/api/photos?directory="+newDir, nil)
+	// getPhotos must work against the dated subdirectory.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/photos?directory="+dateSubdir, nil)
 	w2 := httptest.NewRecorder()
 	getPhotosHandler(w2, req2)
 	if w2.Code != http.StatusOK {
@@ -318,6 +320,100 @@ func TestSaveSelectedPhotos(t *testing.T) {
 	}
 	if len(photos) != 2 {
 		t.Errorf("expected 2 photos in destination, got %d: %v", len(photos), photos)
+	}
+}
+
+// createJPEGWithEXIFDate writes a JPEG to path with DateTimeOriginal set to dateTaken
+// (format "2006:01:02 15:04:05").
+func createJPEGWithEXIFDate(t *testing.T, path, dateTaken string) {
+	t.Helper()
+
+	// Build a minimal little-endian TIFF block with one IFD entry: DateTimeOriginal (0x9003).
+	dateBytes := append([]byte(dateTaken), 0x00) // null-terminated ASCII
+	count := uint32(len(dateBytes))
+	// Layout: 8-byte header + 2-byte IFD count + 12-byte entry + 4-byte next-IFD = 26, then string.
+	stringOffset := uint32(26)
+
+	var tiff bytes.Buffer
+	tiff.WriteString("II")
+	binary.Write(&tiff, binary.LittleEndian, uint16(0x002A))
+	binary.Write(&tiff, binary.LittleEndian, uint32(8)) // IFD at offset 8
+	binary.Write(&tiff, binary.LittleEndian, uint16(1)) // 1 entry
+	binary.Write(&tiff, binary.LittleEndian, uint16(0x9003))
+	binary.Write(&tiff, binary.LittleEndian, uint16(2)) // ASCII
+	binary.Write(&tiff, binary.LittleEndian, count)
+	binary.Write(&tiff, binary.LittleEndian, stringOffset)
+	binary.Write(&tiff, binary.LittleEndian, uint32(0)) // next IFD = 0
+	tiff.Write(dateBytes)
+
+	tiffData := tiff.Bytes()
+	app1Len := uint16(2 + 6 + len(tiffData)) // length includes 2-byte length field
+
+	var app1 bytes.Buffer
+	app1.WriteByte(0xFF)
+	app1.WriteByte(0xE1)
+	binary.Write(&app1, binary.BigEndian, app1Len)
+	app1.WriteString("Exif\x00\x00")
+	app1.Write(tiffData)
+
+	// Encode a base JPEG and insert the APP1 segment immediately after SOI.
+	baseJPEG := encodeTestJPEG(t, 4, 4)
+	var out bytes.Buffer
+	out.Write(baseJPEG[:2]) // FF D8 SOI
+	out.Write(app1.Bytes())
+	out.Write(baseJPEG[2:])
+
+	if err := os.WriteFile(path, out.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSaveSelectedPhotosExifDate verifies that each photo is exported to
+// destBase/YYYY-MM-DD/ using the EXIF DateTimeOriginal date.
+func TestSaveSelectedPhotosExifDate(t *testing.T) {
+	tmp := setupTestDirs(t)
+
+	sourceDir := filepath.Join(tmp, "source")
+	destBase := filepath.Join(tmp, "dest")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two photos with different EXIF dates; one with no EXIF (falls back to today).
+	createJPEGWithEXIFDate(t, filepath.Join(sourceDir, "day1.JPG"), "2024:03:15 08:00:00")
+	createJPEGWithEXIFDate(t, filepath.Join(sourceDir, "day2.JPG"), "2024:07:04 12:30:00")
+	createTestJPEG(t, filepath.Join(sourceDir, "noexif.JPG"))
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"source_directory": sourceDir,
+		"destination_base": destBase,
+		"selected_files":   []string{"day1.JPG", "day2.JPG", "noexif.JPG"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/save", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	saveSelectedPhotosHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("save returned %d: %s", w.Code, w.Body.String())
+	}
+
+	// day1 → destBase/2024-03-15/
+	if _, err := os.Stat(filepath.Join(destBase, "2024-03-15", "day1.JPG")); err != nil {
+		t.Errorf("day1.JPG not found in 2024-03-15/: %v", err)
+	}
+	// day2 → destBase/2024-07-04/
+	if _, err := os.Stat(filepath.Join(destBase, "2024-07-04", "day2.JPG")); err != nil {
+		t.Errorf("day2.JPG not found in 2024-07-04/: %v", err)
+	}
+	// noexif → destBase/<today>/
+	today := time.Now().Format("2006-01-02")
+	if _, err := os.Stat(filepath.Join(destBase, today, "noexif.JPG")); err != nil {
+		t.Errorf("noexif.JPG not found in %s/: %v", today, err)
+	}
+	// day1 must not bleed into day2's folder
+	if _, err := os.Stat(filepath.Join(destBase, "2024-07-04", "day1.JPG")); err == nil {
+		t.Errorf("day1.JPG should not be in 2024-07-04/")
 	}
 }
 
