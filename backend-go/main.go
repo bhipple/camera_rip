@@ -717,7 +717,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 		Until           string `json:"until"`
 		SkipDuplicates  bool   `json:"skip_duplicates"`
 		TargetDirectory string `json:"target_directory"`
-		ImportVideos    bool   `json:"import_videos"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
@@ -794,7 +793,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 	filesToImport := 0
 	skippedDuplicates := 0
 	skippedByDate := 0
-	skippedVideos := 0
 	dailyBreakdown := make(map[string]int)
 
 	for _, file := range allFiles {
@@ -810,10 +808,7 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 			totalFiles++
 		}
 
-		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
-			if isMp4 {
-				skippedVideos++
-			}
+		if !isImage && !isRaw && !isMp4 {
 			continue
 		}
 
@@ -854,7 +849,6 @@ func importFromFolderPreviewHandler(w http.ResponseWriter, r *http.Request) {
 		"files_to_import":    filesToImport,
 		"skipped_duplicates": skippedDuplicates,
 		"skipped_by_date":    skippedByDate,
-		"skipped_videos":     skippedVideos,
 		"daily_breakdown":    dailyBreakdown,
 	})
 }
@@ -866,7 +860,6 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		SourceDirectory string `json:"source_directory"`
 		Since           string `json:"since"`
 		Until           string `json:"until"`
-		ImportVideos    bool   `json:"import_videos"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil && err != io.EOF {
@@ -914,7 +907,7 @@ func importFromFolderHandler(w http.ResponseWriter, r *http.Request) {
 		isRaw := strings.HasSuffix(lowerName, ".cr3") || strings.HasSuffix(lowerName, ".orf")
 		isMp4 := strings.HasSuffix(lowerName, ".mp4")
 
-		if !isImage && !isRaw && (!isMp4 || !data.ImportVideos) {
+		if !isImage && !isRaw && !isMp4 {
 			return nil
 		}
 		modTime := info.ModTime()

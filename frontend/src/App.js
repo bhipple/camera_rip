@@ -41,8 +41,7 @@ function App() {
     });
     const [untilDate, setUntilDate] = useState('');
     const [skipDuplicates, setSkipDuplicates] = useState(true);
-    const [importVideos, setImportVideos] = useState(false);
-    const [pinnedPhoto, setPinnedPhoto] = useState(null);
+const [pinnedPhoto, setPinnedPhoto] = useState(null);
     const [showDeletePhotosModal, setShowDeletePhotosModal] = useState(false);
     const [isDeletingPhotos, setIsDeletingPhotos] = useState(false);
     const [carouselFilter, setCarouselFilter] = useState('all');
@@ -100,7 +99,6 @@ function App() {
                     since: sinceDate,
                     until: untilDate,
                     skip_duplicates: skipDuplicates,
-                    import_videos: importVideos,
                 }),
             });
             const data = await response.json();
@@ -113,7 +111,7 @@ function App() {
             setImportPreview(null);
         }
         setIsLoadingPreview(false);
-    }, [sinceDate, untilDate, skipDuplicates, importVideos, sourceDirectory, destinationBase]);
+    }, [sinceDate, untilDate, skipDuplicates, sourceDirectory, destinationBase]);
 
     useEffect(() => {
         fetchImportPreview();
@@ -130,7 +128,6 @@ function App() {
                     source_directory: sourceDirectory,
                     since: sinceDate,
                     until: untilDate,
-                    import_videos: importVideos,
                 }),
             });
             const responseText = await response.text();
@@ -721,17 +718,6 @@ function App() {
                             <span>Skip already imported</span>
                         </label>
                     </div>
-                    <div className="checkbox-container">
-                        <label>
-                            <input
-                                type="checkbox"
-                                checked={importVideos}
-                                onChange={e => setImportVideos(e.target.checked)}
-                            />
-                            <span>Import videos (.MP4)</span>
-                        </label>
-                    </div>
-
                     {/* Import Preview */}
                     {isLoadingPreview ? (
                         <div className="import-preview loading">
@@ -769,12 +755,6 @@ function App() {
                                         <div className="preview-stat">
                                             <span className="preview-label">Will skip (date filter):</span>
                                             <span className="preview-value">{importPreview.skipped_by_date}</span>
-                                        </div>
-                                    )}
-                                    {importPreview.skipped_videos > 0 && (
-                                        <div className="preview-stat">
-                                            <span className="preview-label">Will skip (videos):</span>
-                                            <span className="preview-value">{importPreview.skipped_videos}</span>
                                         </div>
                                     )}
                                     <div className="preview-stat">
